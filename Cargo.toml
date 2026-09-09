@@ -1,0 +1,42 @@
+[package]
+name = "rectangle_decomposition"
+version = "0.1.0"
+edition = "2024"
+description = "64x64 稀疏 quad 的矩形分解"
+readme = "README.md"
+
+[features]
+profile = []
+
+[dev-dependencies]
+criterion = "0.8.2"
+
+[[bench]]
+name = "worst_case"
+harness = false
+
+[[example]]
+name = "worst_case_profile"
+required-features = ["profile"]
+
+[lints.rust]
+unsafe_code = "deny"
+
+[lints.clippy]
+todo = "deny"
+unimplemented = "deny"
+panic = "warn"
+indexing_slicing = "warn"
+unwrap_used = "warn"
+expect_used = "warn"
+panic_in_result_fn = "warn"
+unreachable = "warn"
+shadow_unrelated = "warn"
+shadow_same = "warn"
+complexity = { level = "warn", priority = -1 }
+correctness = { level = "warn", priority = -1 }
+nursery = { level = "warn", priority = -1 }
+pedantic = { level = "warn", priority = -1 }
+perf = { level = "warn", priority = -1 }
+style = { level = "warn", priority = -1 }
+suspicious = { level = "warn", priority = -1 }
