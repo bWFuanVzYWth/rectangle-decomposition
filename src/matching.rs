@@ -6,6 +6,7 @@
 #[cfg(feature = "profile")]
 use std::time::{Duration, Instant};
 
+use crate::fixed::FixedVec;
 use crate::types::ChordAccess;
 #[cfg(test)]
 use crate::types::EffectiveChord;
@@ -15,6 +16,9 @@ pub const IMAGE64_AXIS_LIMIT: usize = 64;
 pub const IMAGE64_AXIS_LEN: usize = IMAGE64_AXIS_LIMIT + 1;
 pub const IMAGE64_GRID_POINTS: usize = IMAGE64_AXIS_LEN * IMAGE64_AXIS_LEN;
 pub const IMAGE64_MAX_CONFLICT_EDGES: usize = (IMAGE64_AXIS_LIMIT - 1) * (IMAGE64_AXIS_LIMIT - 1);
+/// 每条内部格线至多有 floor(63 / 2) 条端点互异的同向 chord。
+pub const IMAGE64_MAX_CHORDS: usize = (IMAGE64_AXIS_LIMIT - 1) * ((IMAGE64_AXIS_LIMIT - 1) / 2);
+pub type ChordBuffer<T> = FixedVec<T, IMAGE64_MAX_CHORDS>;
 
 #[cfg(test)]
 #[derive(Debug)]
@@ -65,13 +69,13 @@ pub struct SparseAdjacencyRef<'a> {
 #[derive(Clone, Debug)]
 pub struct ConflictFinalizeScratch {
     /// 前半段为右顶点的边段起点，后半段为按 (度数, 编号) 排序的右顶点。
-    pub(super) right_layout: Vec<u32>,
-    pub(super) next_offsets: Vec<usize>,
+    pub(super) right_layout: FixedVec<u32, { 2 * IMAGE64_MAX_CHORDS }>,
+    pub(super) next_offsets: ChordBuffer<usize>,
     pub(super) edge_buffer: [SparseEdge; IMAGE64_MAX_CONFLICT_EDGES],
     pub(super) edge_count: usize,
-    pub(super) right_degrees: Vec<u8>,
-    pub(super) adjacency_offsets: Vec<usize>,
-    pub(super) adjacency_edges: Vec<u16>,
+    pub(super) right_degrees: ChordBuffer<u8>,
+    pub(super) adjacency_offsets: FixedVec<usize, { IMAGE64_MAX_CHORDS + 1 }>,
+    pub(super) adjacency_edges: FixedVec<u16, IMAGE64_MAX_CONFLICT_EDGES>,
     pub(super) horizontal_grid: [u16; IMAGE64_GRID_POINTS],
     pub(super) horizontal_grid_marks: [u16; IMAGE64_GRID_POINTS],
     pub(super) horizontal_y_masks: [u64; IMAGE64_AXIS_LEN],
@@ -81,14 +85,20 @@ pub struct ConflictFinalizeScratch {
 
 impl Default for ConflictFinalizeScratch {
     fn default() -> Self {
+        const { Self::new() }
+    }
+}
+
+impl ConflictFinalizeScratch {
+    const fn new() -> Self {
         Self {
-            right_layout: Vec::new(),
-            next_offsets: Vec::new(),
+            right_layout: FixedVec::new(0),
+            next_offsets: FixedVec::new(0),
             edge_buffer: [SparseEdge { left: 0, right: 0 }; IMAGE64_MAX_CONFLICT_EDGES],
             edge_count: 0,
-            right_degrees: Vec::new(),
-            adjacency_offsets: Vec::new(),
-            adjacency_edges: Vec::new(),
+            right_degrees: FixedVec::new(0),
+            adjacency_offsets: FixedVec::new(0),
+            adjacency_edges: FixedVec::new(0),
             horizontal_grid: [u16::MAX; IMAGE64_GRID_POINTS],
             horizontal_grid_marks: [0; IMAGE64_GRID_POINTS],
             horizontal_y_masks: [0; IMAGE64_AXIS_LEN],
@@ -104,32 +114,65 @@ pub struct ConflictScratch {
 }
 
 /// HKDW 算法阶段的复用 scratch。
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub struct HkScratch {
-    pub(super) pair_left: Vec<u16>,
-    pub(super) pair_right: Vec<u16>,
-    pub(super) right_distance: Vec<u16>,
-    pub(super) queue: Vec<u16>,
-    pub(super) unmatched_lefts: Vec<u16>,
+    pub(super) pair_left: ChordBuffer<u16>,
+    pub(super) pair_right: ChordBuffer<u16>,
+    pub(super) right_distance: ChordBuffer<u16>,
+    pub(super) queue: ChordBuffer<u16>,
+    pub(super) unmatched_lefts: ChordBuffer<u16>,
     /// 最短层上的空闲左顶点，可重复；长度至多为冲突边数。
-    pub(super) shortest_roots: Vec<u16>,
+    pub(super) shortest_roots: FixedVec<u16, IMAGE64_MAX_CONFLICT_EDGES>,
     /// 搜索时复用为本轮访问标记，结束后保存独立集所需的可达性。
-    pub(super) reachable_left: Vec<bool>,
-    pub(super) reachable_right: Vec<bool>,
-    pub(super) transpose_offsets: Vec<usize>,
-    pub(super) transpose_edges: Vec<u16>,
-    pub(super) write_offsets: Vec<usize>,
-    pub(super) right_order: Vec<u16>,
-    pub(super) right_degree_counts: Vec<usize>,
-    pub(super) dfs_stack: Vec<(usize, usize)>,
+    pub(super) reachable_left: ChordBuffer<bool>,
+    pub(super) reachable_right: ChordBuffer<bool>,
+    pub(super) transpose_offsets: FixedVec<usize, { IMAGE64_MAX_CHORDS + 1 }>,
+    pub(super) transpose_edges: FixedVec<u16, IMAGE64_MAX_CONFLICT_EDGES>,
+    pub(super) write_offsets: ChordBuffer<usize>,
+    pub(super) right_order: ChordBuffer<u16>,
+    pub(super) right_degree_counts: FixedVec<usize, IMAGE64_AXIS_LIMIT>,
+    pub(super) dfs_stack: ChordBuffer<(usize, usize)>,
 }
 
-#[derive(Clone, Debug, Default)]
+impl HkScratch {
+    const fn new() -> Self {
+        Self {
+            pair_left: FixedVec::new(0),
+            pair_right: FixedVec::new(0),
+            right_distance: FixedVec::new(0),
+            queue: FixedVec::new(0),
+            unmatched_lefts: FixedVec::new(0),
+            shortest_roots: FixedVec::new(0),
+            reachable_left: FixedVec::new(false),
+            reachable_right: FixedVec::new(false),
+            transpose_offsets: FixedVec::new(0),
+            transpose_edges: FixedVec::new(0),
+            write_offsets: FixedVec::new(0),
+            right_order: FixedVec::new(0),
+            right_degree_counts: FixedVec::new(0),
+            dfs_stack: FixedVec::new((0, 0)),
+        }
+    }
+}
+
+impl Default for HkScratch {
+    fn default() -> Self {
+        const { Self::new() }
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct MatchingScratch {
     pub(super) hk: HkScratch,
     pub(super) conflict: ConflictScratch,
-    selected_horizontal: Vec<u16>,
-    selected_vertical: Vec<u16>,
+    selected_horizontal: ChordBuffer<u16>,
+    selected_vertical: ChordBuffer<u16>,
+}
+
+impl Default for MatchingScratch {
+    fn default() -> Self {
+        const { Self::new() }
+    }
 }
 
 impl SparseAdjacencyRef<'_> {
@@ -144,40 +187,15 @@ impl SparseAdjacencyRef<'_> {
 pub const UNMATCHED_U16: u16 = u16::MAX;
 
 impl MatchingScratch {
-    /// 为 64x64 输入的 matching 阶段预分配容量。
-    ///
-    /// 资源契约：成功后 matching hot path 不需要扩容，除非未来上界被改大。
-    pub(crate) fn preallocate_64(&mut self) -> Result<(), crate::SparseQuadError> {
-        let max_chords = IMAGE64_AXIS_LIMIT * (IMAGE64_AXIS_LIMIT - 1);
-        reserve_vec(&mut self.conflict.finalize.right_layout, 2 * max_chords)?;
-        reserve_vec(&mut self.conflict.finalize.next_offsets, max_chords)?;
-        reserve_vec(&mut self.conflict.finalize.right_degrees, max_chords)?;
-        reserve_vec(
-            &mut self.conflict.finalize.adjacency_offsets,
-            max_chords + 1,
-        )?;
-        reserve_vec(
-            &mut self.conflict.finalize.adjacency_edges,
-            IMAGE64_MAX_CONFLICT_EDGES,
-        )?;
-
-        reserve_vec(&mut self.hk.pair_left, max_chords)?;
-        reserve_vec(&mut self.hk.pair_right, max_chords)?;
-        reserve_vec(&mut self.hk.right_distance, max_chords)?;
-        reserve_vec(&mut self.hk.queue, max_chords)?;
-        reserve_vec(&mut self.hk.unmatched_lefts, max_chords)?;
-        reserve_vec(&mut self.hk.shortest_roots, IMAGE64_MAX_CONFLICT_EDGES)?;
-        reserve_vec(&mut self.hk.reachable_left, max_chords)?;
-        reserve_vec(&mut self.hk.reachable_right, max_chords)?;
-        reserve_vec(&mut self.hk.transpose_offsets, max_chords + 1)?;
-        reserve_vec(&mut self.hk.transpose_edges, IMAGE64_MAX_CONFLICT_EDGES)?;
-        reserve_vec(&mut self.hk.write_offsets, max_chords)?;
-        reserve_vec(&mut self.hk.right_order, max_chords)?;
-        reserve_vec(&mut self.hk.right_degree_counts, IMAGE64_AXIS_LIMIT)?;
-        reserve_vec(&mut self.hk.dfs_stack, max_chords)?;
-        reserve_vec(&mut self.selected_horizontal, max_chords)?;
-        reserve_vec(&mut self.selected_vertical, max_chords)?;
-        Ok(())
+    pub(crate) const fn new() -> Self {
+        Self {
+            hk: HkScratch::new(),
+            conflict: ConflictScratch {
+                finalize: ConflictFinalizeScratch::new(),
+            },
+            selected_horizontal: FixedVec::new(0),
+            selected_vertical: FixedVec::new(0),
+        }
     }
 
     #[cfg(test)]
@@ -278,8 +296,8 @@ impl MatchingScratch {
 fn select_full_independent_set(
     horizontal_len: usize,
     vertical_len: usize,
-    horizontal_out: &mut Vec<u16>,
-    vertical_out: &mut Vec<u16>,
+    horizontal_out: &mut ChordBuffer<u16>,
+    vertical_out: &mut ChordBuffer<u16>,
 ) {
     for index in 0..horizontal_len {
         horizontal_out.push(crate::u16_index(index));
@@ -316,15 +334,6 @@ fn selected_from_scratch(scratch: &MatchingScratch) -> MaximumIndependentSet {
             .map(|&index| usize::from(index))
             .collect(),
     }
-}
-
-fn reserve_vec<T>(items: &mut Vec<T>, capacity: usize) -> Result<(), crate::SparseQuadError> {
-    if items.capacity() >= capacity {
-        return Ok(());
-    }
-    items
-        .try_reserve_exact(capacity - items.capacity())
-        .map_err(|_| crate::SparseQuadError::AllocationFailed)
 }
 
 #[cfg(test)]

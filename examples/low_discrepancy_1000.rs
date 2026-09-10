@@ -14,7 +14,7 @@ const CASES_F64: f64 = 1000.0;
 fn main() -> Result<(), SparseQuadError> {
     let cases = low_discrepancy_cases();
     let unique_cases = unique_case_count(&cases);
-    let mut scratch = SparseOptimalScratch64::try_new_preallocated()?;
+    let mut scratch = SparseOptimalScratch64::new();
 
     for leaves in &cases {
         let rectangles = scratch.decompose_borrowed(black_box(leaves.as_slice()))?;

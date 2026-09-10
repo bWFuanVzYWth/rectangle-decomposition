@@ -16,7 +16,7 @@ const ITERATIONS: u32 = 256;
 
 fn main() -> Result<(), SparseQuadError> {
     let leaves = low_discrepancy_holes_7_8_leaves();
-    let mut scratch = SparseOptimalScratch64::try_new_preallocated()?;
+    let mut scratch = SparseOptimalScratch64::new();
 
     for _ in 0..WARMUP_ITERATIONS {
         let profile = scratch.decompose_profile(black_box(leaves.as_slice()))?;

@@ -219,7 +219,6 @@ mod tests {
     #[test]
     fn linear_scatter_matches_comparison_sort_with_ties_and_empty_vertices() {
         let mut storage = MatchingScratch::default();
-        assert!(storage.preallocate_64().is_ok());
         let scratch = &mut storage.conflict.finalize;
         let capacity = scratch.right_layout.capacity();
         let mut columns = [

@@ -1,6 +1,9 @@
 //! 贪心匹配初始化：度 1 匹配、按右部度数排序、3 跳增广。
 
-use crate::matching::{HkScratch, SparseAdjacencyRef, UNMATCHED_U16};
+use crate::fixed::FixedVec;
+use crate::matching::{
+    ChordBuffer, HkScratch, IMAGE64_AXIS_LIMIT, SparseAdjacencyRef, UNMATCHED_U16,
+};
 use crate::{copy, get_mut, slice, u16_index};
 
 pub fn greedy_augment_len3_sparse_csr_u16(
@@ -107,8 +110,8 @@ pub fn greedy_initialize_sparse_matching_csr_u16(
 
 fn counting_sort_right_order_u16(
     right_degrees: &[u8],
-    right_order: &mut Vec<u16>,
-    degree_counts: &mut Vec<usize>,
+    right_order: &mut ChordBuffer<u16>,
+    degree_counts: &mut FixedVec<usize, IMAGE64_AXIS_LIMIT>,
 ) {
     let max_degree = usize::from(right_degrees.iter().copied().max().unwrap_or(0));
     degree_counts.clear();

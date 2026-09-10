@@ -77,8 +77,7 @@ fn radical_inverse_base3_64(mut value: u32) -> u8 {
 
 fn bench_low_discrepancy_holes_7_8(c: &mut Criterion) {
     let leaves = low_discrepancy_holes_7_8_leaves();
-    let mut scratch =
-        SparseOptimalScratch64::try_new_preallocated().unwrap_or_else(|_| std::process::abort());
+    let mut scratch = SparseOptimalScratch64::new();
 
     c.bench_function("low_discrepancy_holes_7_8_64", |b| {
         b.iter(|| {
@@ -99,7 +98,10 @@ fn bench_prepare_image(c: &mut Criterion) {
 
 fn bench_scratch_init(c: &mut Criterion) {
     c.bench_function("scratch_init_64", |b| {
-        b.iter(|| black_box(SparseOptimalScratch64::new()));
+        b.iter(|| {
+            let mut scratch = SparseOptimalScratch64::new();
+            black_box(&mut scratch);
+        });
     });
 }
 

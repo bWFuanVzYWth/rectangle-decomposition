@@ -2,6 +2,7 @@
 //! 的 chord-and-matching 归约。
 
 mod corners;
+mod fixed;
 mod graph;
 mod greedy;
 mod hk;

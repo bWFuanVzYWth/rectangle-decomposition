@@ -417,7 +417,7 @@ mod tests {
                 // 长 3 的最短路径和长 5 的追加路径在同一轮完成。
                 assert_eq!(augmentations, 2);
             }
-            assert_eq!(scratch.pair_left, [0, 1, 2, 3, 4]);
+            assert_eq!(scratch.pair_left.as_slice(), &[0, 1, 2, 3, 4]);
             collect_reachable(&adjacency, &mut scratch);
             assert_eq!(assert_optimal_certificate(&adjacency, &scratch), 5);
         }
@@ -438,7 +438,6 @@ mod tests {
         let graph = Graph::new(&rows, size);
         let adjacency = graph.adjacency();
         let mut storage = MatchingScratch::default();
-        assert!(storage.preallocate_64().is_ok());
         let scratch = &mut storage.hk;
         let stack_capacity = scratch.dfs_stack.capacity();
         initialize_matching(&adjacency, size, &graph.degrees, scratch);
@@ -464,7 +463,6 @@ mod tests {
         let graph = Graph::new(&rows, 63);
         let adjacency = graph.adjacency();
         let mut storage = MatchingScratch::default();
-        assert!(storage.preallocate_64().is_ok());
         let scratch = &mut storage.hk;
         let roots_capacity = scratch.shortest_roots.capacity();
         initialize_matching(&adjacency, 63, &graph.degrees, scratch);
@@ -510,10 +508,19 @@ mod tests {
                     &mut profiled,
                 );
                 assert_eq!(counts.greedy_matches + counts.augmentations, matched);
-                assert_eq!(profiled.pair_left, scratch.pair_left);
-                assert_eq!(profiled.pair_right, scratch.pair_right);
-                assert_eq!(profiled.reachable_left, scratch.reachable_left);
-                assert_eq!(profiled.reachable_right, scratch.reachable_right);
+                assert_eq!(profiled.pair_left.as_slice(), scratch.pair_left.as_slice());
+                assert_eq!(
+                    profiled.pair_right.as_slice(),
+                    scratch.pair_right.as_slice()
+                );
+                assert_eq!(
+                    profiled.reachable_left.as_slice(),
+                    scratch.reachable_left.as_slice()
+                );
+                assert_eq!(
+                    profiled.reachable_right.as_slice(),
+                    scratch.reachable_right.as_slice()
+                );
             }
         }
     }

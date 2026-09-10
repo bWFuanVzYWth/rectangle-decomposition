@@ -8,7 +8,8 @@ use std::num::NonZeroU16;
 use std::time::{Duration, Instant};
 
 use crate::corners::{Corners, horizontal_support_from_corners, vertical_support_from_corners};
-use crate::matching::MatchingScratch;
+use crate::fixed::FixedVec;
+use crate::matching::{ChordBuffer, MatchingScratch};
 use crate::types::{ActiveRect, ChordAccess, EffectiveChord, Orientation, RangeU8, Rectangle, Run};
 use crate::{get, slice, slice_mut};
 
@@ -17,8 +18,25 @@ const EDGE_U8: u8 = 64;
 const MAX_LOD: u8 = 6;
 const MAX_AXIS_INTERVALS: usize = EDGE * EDGE;
 const MAX_AXIS_EVENTS: usize = MAX_AXIS_INTERVALS * 2;
-const MAX_CHORDS_PER_ORIENTATION: usize = EDGE * (EDGE - 1);
+// 每个有 chord 的颜色至少占 4 个像素；不同颜色不能共享像素。
+const MAX_CHORD_GROUPS: usize = EDGE * EDGE / 4;
 const MAX_RECTANGLES: usize = EDGE * EDGE;
+const EMPTY_INTERVAL: Interval = Interval {
+    start: 0,
+    end: 0,
+    value: 0,
+};
+const EMPTY_CHORD: ValuedChord = ValuedChord {
+    value: 0,
+    order: 0,
+    chord: EffectiveChord {
+        orientation: Orientation::Horizontal,
+        x1: 0,
+        y1: 0,
+        x2: 0,
+        y2: 0,
+    },
+};
 
 /// 64x64 sparse quad image 的非零叶子。
 ///
@@ -160,94 +178,106 @@ impl SparseQuadImage64 {
     }
 }
 
-/// sparse optimal 分解的可复用 scratch。
+/// sparse optimal 分解的固定容量内联 scratch。
+///
+/// 可以放在 worker 栈上复用；对象较大，调用时传递 `&mut`，避免按值传递。
 pub struct SparseOptimalScratch64 {
-    row_events: Vec<AxisEvent>,
-    column_events: Vec<AxisEvent>,
+    row_events: FixedVec<AxisEvent, MAX_AXIS_EVENTS>,
+    column_events: FixedVec<AxisEvent, MAX_AXIS_EVENTS>,
     row_buckets: [IntervalBucket; EDGE],
     column_buckets: [IntervalBucket; EDGE],
     rows: AxisIntervals,
     columns: AxisIntervals,
-    active_intervals: Vec<Interval>,
-    normalized_intervals: Vec<Interval>,
+    active_intervals: FixedVec<Interval, EDGE>,
+    normalized_intervals: FixedVec<Interval, EDGE>,
     chord_groups: SparseChordGroups,
     matching: MatchingScratch,
-    horizontal_cuts: Vec<HorizontalCut>,
-    vertical_cuts: Vec<VerticalCut>,
-    horizontal_cut_masks: Vec<u64>,
-    vertical_cut_masks: Vec<u128>,
-    runs: Vec<Run>,
-    active_rects: Vec<ActiveRect>,
-    next_active_rects: Vec<ActiveRect>,
-    rectangles: Vec<Rectangle>,
+    horizontal_cuts: ChordBuffer<HorizontalCut>,
+    vertical_cuts: ChordBuffer<VerticalCut>,
+    horizontal_cut_masks: FixedVec<u64, EDGE>,
+    vertical_cut_masks: FixedVec<u128, EDGE>,
+    runs: FixedVec<Run, EDGE>,
+    active_rects: FixedVec<ActiveRect, EDGE>,
+    next_active_rects: FixedVec<ActiveRect, EDGE>,
+    rectangles: FixedVec<Rectangle, MAX_RECTANGLES>,
 }
 
 impl Default for SparseOptimalScratch64 {
     fn default() -> Self {
-        Self {
-            row_events: Vec::new(),
-            column_events: Vec::new(),
-            row_buckets: std::array::from_fn(|_| IntervalBucket::new()),
-            column_buckets: std::array::from_fn(|_| IntervalBucket::new()),
-            rows: AxisIntervals::default(),
-            columns: AxisIntervals::default(),
-            active_intervals: Vec::new(),
-            normalized_intervals: Vec::new(),
-            chord_groups: SparseChordGroups::default(),
-            matching: MatchingScratch::default(),
-            horizontal_cuts: Vec::new(),
-            vertical_cuts: Vec::new(),
-            horizontal_cut_masks: Vec::new(),
-            vertical_cut_masks: Vec::new(),
-            runs: Vec::new(),
-            active_rects: Vec::new(),
-            next_active_rects: Vec::new(),
-            rectangles: Vec::new(),
-        }
+        const { Self::new() }
     }
 }
 
 impl SparseOptimalScratch64 {
+    /// 创建可直接使用的内联缓存；初始化与借用分解均不分配堆内存。
+    /// 在 worker 的任务循环外创建一次，并通过可变引用复用。
     #[must_use]
-    pub fn new() -> Self {
-        Self::default()
+    #[allow(clippy::large_stack_arrays)] // 固定容量栈 scratch；整个初值在 const 块中求值。
+    pub const fn new() -> Self {
+        const {
+            Self {
+                row_events: FixedVec::new(AxisEvent {
+                    coord: 0,
+                    is_end: false,
+                    interval: EMPTY_INTERVAL,
+                }),
+                column_events: FixedVec::new(AxisEvent {
+                    coord: 0,
+                    is_end: false,
+                    interval: EMPTY_INTERVAL,
+                }),
+                row_buckets: [const { IntervalBucket::new() }; EDGE],
+                column_buckets: [const { IntervalBucket::new() }; EDGE],
+                rows: AxisIntervals::new(),
+                columns: AxisIntervals::new(),
+                active_intervals: FixedVec::new(EMPTY_INTERVAL),
+                normalized_intervals: FixedVec::new(EMPTY_INTERVAL),
+                chord_groups: SparseChordGroups::new(),
+                matching: MatchingScratch::new(),
+                horizontal_cuts: FixedVec::new(HorizontalCut {
+                    y: 0,
+                    start: 0,
+                    end: 0,
+                }),
+                vertical_cuts: FixedVec::new(VerticalCut {
+                    x: 0,
+                    start: 0,
+                    end: 0,
+                }),
+                horizontal_cut_masks: FixedVec::new(0),
+                vertical_cut_masks: FixedVec::new(0),
+                runs: FixedVec::new(Run {
+                    value: 0,
+                    x_start: 0,
+                    x_end: 0,
+                }),
+                active_rects: FixedVec::new(ActiveRect::new(0, 0, 0, 0)),
+                next_active_rects: FixedVec::new(ActiveRect::new(0, 0, 0, 0)),
+                rectangles: FixedVec::new(Rectangle {
+                    value: 0,
+                    x: RangeU8::new(0, 0),
+                    y: RangeU8::new(0, 0),
+                }),
+            }
+        }
     }
 
-    /// 创建并预分配 64x64 hot path 所需 scratch。
-    ///
-    /// 资源契约：成功后使用 `decompose_borrowed` 不需要为固定上界缓存扩容。
+    /// 兼容原预分配入口；现在等价于 `Ok(Self::new())`，不调用分配器。
+    /// 新代码应直接使用 `new()`，避免大对象在 `Result` 中按值搬运。
     ///
     /// # Errors
     ///
-    /// 内部缓存无法分配时返回错误。
-    pub fn try_new_preallocated() -> Result<Self, SparseQuadError> {
-        let mut scratch = Self::new();
-        scratch.preallocate_64()?;
-        Ok(scratch)
+    /// 当前固定容量实现始终返回 `Ok`。
+    pub const fn try_new_preallocated() -> Result<Self, SparseQuadError> {
+        const { Ok(Self::new()) }
     }
 
-    /// 预分配 64x64 hot path 所需 scratch。
+    /// 兼容原预分配入口；容量已内联，本方法不修改缓存或已有结果。
     ///
     /// # Errors
     ///
-    /// 内部缓存无法分配时返回错误。
-    pub fn preallocate_64(&mut self) -> Result<(), SparseQuadError> {
-        preallocate_exact(&mut self.row_events, MAX_AXIS_EVENTS)?;
-        preallocate_exact(&mut self.column_events, MAX_AXIS_EVENTS)?;
-        self.rows.preallocate_64()?;
-        self.columns.preallocate_64()?;
-        preallocate_exact(&mut self.active_intervals, EDGE)?;
-        preallocate_exact(&mut self.normalized_intervals, EDGE)?;
-        self.chord_groups.preallocate_64()?;
-        self.matching.preallocate_64()?;
-        preallocate_exact(&mut self.horizontal_cuts, MAX_CHORDS_PER_ORIENTATION)?;
-        preallocate_exact(&mut self.vertical_cuts, MAX_CHORDS_PER_ORIENTATION)?;
-        preallocate_exact(&mut self.horizontal_cut_masks, EDGE)?;
-        preallocate_exact(&mut self.vertical_cut_masks, EDGE)?;
-        preallocate_exact(&mut self.runs, EDGE)?;
-        preallocate_exact(&mut self.active_rects, EDGE)?;
-        preallocate_exact(&mut self.next_active_rects, EDGE)?;
-        preallocate_exact(&mut self.rectangles, MAX_RECTANGLES)?;
+    /// 当前固定容量实现始终返回 `Ok`。
+    pub const fn preallocate_64(&mut self) -> Result<(), SparseQuadError> {
         Ok(())
     }
 
@@ -259,13 +289,12 @@ impl SparseOptimalScratch64 {
     ///
     /// leaf 越界、未按 lod 对齐、lod 超出范围、互相重叠或内部缓存无法分配时返回错误。
     pub fn decompose(&mut self, leaves: &[QuadLeaf64]) -> Result<Vec<Rectangle>, SparseQuadError> {
-        self.preallocate_64()?;
         Ok(self.decompose_borrowed(leaves)?.to_vec())
     }
 
     /// 对 sparse quad leaves 执行 64x64 最优分解，结果借用自 scratch。
     ///
-    /// 资源契约：调用 `preallocate_64` 成功后，本函数不需要扩容固定上界缓存。
+    /// 资源契约：从 `new()` 创建后即可使用，本函数不调用堆分配器。
     ///
     /// # Errors
     ///
@@ -296,7 +325,6 @@ impl SparseOptimalScratch64 {
         &mut self,
         leaves: &[QuadLeaf64],
     ) -> Result<SparseDecomposeProfile, SparseQuadError> {
-        self.preallocate_64()?;
         let total_start = Instant::now();
         let axis_start = Instant::now();
         build_axis_intervals_from_leaves(
@@ -371,7 +399,6 @@ impl SparseOptimalScratch64 {
         &mut self,
         image: &SparseQuadImage64,
     ) -> Result<Vec<Rectangle>, SparseQuadError> {
-        self.preallocate_64()?;
         Ok(self.decompose_quads_borrowed(image)?.to_vec())
     }
 
@@ -543,8 +570,8 @@ impl SparseOptimalScratch64 {
         let horizontal_cut_masks = &self.horizontal_cut_masks;
         let vertical_cut_masks = &self.vertical_cut_masks;
         let runs = &mut self.runs;
-        let active = &mut self.active_rects;
-        let next_active = &mut self.next_active_rects;
+        let mut active = &mut self.active_rects;
+        let mut next_active = &mut self.next_active_rects;
 
         let result = &mut self.rectangles;
         result.clear();
@@ -578,7 +605,8 @@ impl SparseOptimalScratch64 {
                 next_active,
                 result,
             )?;
-            std::mem::swap(active, next_active);
+            // 交换视图，避免逐行复制两个内联数组。
+            std::mem::swap(&mut active, &mut next_active);
         }
 
         for &active_rect in active.as_slice() {
@@ -649,7 +677,6 @@ impl SparseLayerBuilder64 {
             return Ok(Vec::new());
         }
 
-        scratch.preallocate_64()?;
         build_axis_intervals_from_line_intervals(&mut self.row_intervals, &mut scratch.rows, true)?;
         build_axis_intervals_from_line_intervals(
             &mut self.column_intervals,
@@ -759,16 +786,17 @@ struct LineRange {
     end: usize,
 }
 
-#[derive(Default)]
 struct AxisIntervals {
-    lines: Vec<LineRange>,
-    intervals: Vec<Interval>,
+    lines: FixedVec<LineRange, EDGE>,
+    intervals: FixedVec<Interval, MAX_AXIS_INTERVALS>,
 }
 
 impl AxisIntervals {
-    fn preallocate_64(&mut self) -> Result<(), SparseQuadError> {
-        preallocate_exact(&mut self.lines, EDGE)?;
-        preallocate_exact(&mut self.intervals, MAX_AXIS_INTERVALS)
+    const fn new() -> Self {
+        Self {
+            lines: FixedVec::new(LineRange { start: 0, end: 0 }),
+            intervals: FixedVec::new(EMPTY_INTERVAL),
+        }
     }
 
     fn clear_for_build(&mut self) -> Result<(), SparseQuadError> {
@@ -789,8 +817,8 @@ impl AxisIntervals {
 
 fn build_axis_events(
     image: &SparseQuadImage64,
-    row_events: &mut Vec<AxisEvent>,
-    column_events: &mut Vec<AxisEvent>,
+    row_events: &mut FixedVec<AxisEvent, MAX_AXIS_EVENTS>,
+    column_events: &mut FixedVec<AxisEvent, MAX_AXIS_EVENTS>,
 ) -> Result<(), SparseQuadError> {
     row_events.clear();
     column_events.clear();
@@ -811,8 +839,8 @@ fn build_axis_events(
 fn push_axis_events(
     leaf: QuadLeaf64,
     size: u8,
-    row_events: &mut Vec<AxisEvent>,
-    column_events: &mut Vec<AxisEvent>,
+    row_events: &mut FixedVec<AxisEvent, MAX_AXIS_EVENTS>,
+    column_events: &mut FixedVec<AxisEvent, MAX_AXIS_EVENTS>,
 ) {
     let u1 = leaf.u + size;
     let v1 = leaf.v + size;
@@ -1025,8 +1053,8 @@ fn build_axis_intervals_from_buckets(
 fn build_axis_intervals(
     events: &mut [AxisEvent],
     output: &mut AxisIntervals,
-    active: &mut Vec<Interval>,
-    normalized: &mut Vec<Interval>,
+    active: &mut FixedVec<Interval, EDGE>,
+    normalized: &mut FixedVec<Interval, EDGE>,
     validate_overlap: bool,
 ) -> Result<(), SparseQuadError> {
     events.sort_unstable_by_key(|event| (event.coord, !event.is_end));
@@ -1074,7 +1102,7 @@ fn build_axis_intervals(
 }
 
 fn push_merged_interval(
-    output: &mut Vec<Interval>,
+    output: &mut FixedVec<Interval, MAX_AXIS_INTERVALS>,
     line_start: usize,
     interval: Interval,
 ) -> Result<(), SparseQuadError> {
@@ -1103,7 +1131,7 @@ fn validate_non_overlapping_line(intervals: &[Interval]) -> Result<(), SparseQua
     Ok(())
 }
 
-fn remove_active_interval(active: &mut Vec<Interval>, interval: Interval) {
+fn remove_active_interval(active: &mut FixedVec<Interval, EDGE>, interval: Interval) {
     let Some(position) = active.iter().position(|&item| item == interval) else {
         std::process::abort();
     };
@@ -1112,11 +1140,10 @@ fn remove_active_interval(active: &mut Vec<Interval>, interval: Interval) {
 
 // Chord 提取
 
-#[derive(Default)]
 struct SparseChordGroups {
-    groups: Vec<SparseChordGroup>,
-    horizontal: Vec<ValuedChord>,
-    vertical: Vec<ValuedChord>,
+    groups: FixedVec<SparseChordGroup, MAX_CHORD_GROUPS>,
+    horizontal: ChordBuffer<ValuedChord>,
+    vertical: ChordBuffer<ValuedChord>,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -1141,13 +1168,20 @@ impl ChordAccess for ValuedChord {
 }
 
 impl SparseChordGroups {
-    fn preallocate_64(&mut self) -> Result<(), SparseQuadError> {
-        preallocate_exact(&mut self.groups, MAX_AXIS_INTERVALS)?;
-        preallocate_exact(&mut self.horizontal, MAX_CHORDS_PER_ORIENTATION)?;
-        preallocate_exact(&mut self.vertical, MAX_CHORDS_PER_ORIENTATION)
+    const fn new() -> Self {
+        Self {
+            groups: FixedVec::new(SparseChordGroup {
+                horizontal_start: 0,
+                horizontal_end: 0,
+                vertical_start: 0,
+                vertical_end: 0,
+            }),
+            horizontal: FixedVec::new(EMPTY_CHORD),
+            vertical: FixedVec::new(EMPTY_CHORD),
+        }
     }
 
-    fn clear(&mut self) {
+    const fn clear(&mut self) {
         self.groups.clear();
         self.horizontal.clear();
         self.vertical.clear();
@@ -1488,8 +1522,8 @@ struct VerticalCut {
 fn build_cut_masks(
     horizontal_cuts: &[HorizontalCut],
     vertical_cuts: &[VerticalCut],
-    horizontal_masks: &mut Vec<u64>,
-    vertical_masks: &mut Vec<u128>,
+    horizontal_masks: &mut FixedVec<u64, EDGE>,
+    vertical_masks: &mut FixedVec<u128, EDGE>,
 ) -> Result<(), SparseQuadError> {
     horizontal_masks.clear();
     horizontal_masks.resize(EDGE, 0);
@@ -1519,7 +1553,7 @@ fn build_cut_masks(
 fn build_runs_for_row(
     intervals: &[Interval],
     vertical_cut_mask: u128,
-    runs: &mut Vec<Run>,
+    runs: &mut FixedVec<Run, EDGE>,
 ) -> Result<(), SparseQuadError> {
     runs.clear();
     for &interval in intervals {
@@ -1542,7 +1576,12 @@ fn build_runs_for_row(
     Ok(())
 }
 
-fn push_run(runs: &mut Vec<Run>, value: u16, start: u8, end: u8) -> Result<(), SparseQuadError> {
+fn push_run(
+    runs: &mut FixedVec<Run, EDGE>,
+    value: u16,
+    start: u8,
+    end: u8,
+) -> Result<(), SparseQuadError> {
     if start >= end {
         return Ok(());
     }
@@ -1560,8 +1599,8 @@ fn merge_sparse_runs(
     runs: &[Run],
     y: u8,
     horizontal_cut_mask: u64,
-    next_active: &mut Vec<ActiveRect>,
-    result: &mut Vec<Rectangle>,
+    next_active: &mut FixedVec<ActiveRect, EDGE>,
+    result: &mut FixedVec<Rectangle, MAX_RECTANGLES>,
 ) -> Result<(), SparseQuadError> {
     next_active.clear();
     let (mut active_index, mut run_index) = (0usize, 0usize);
@@ -1638,15 +1677,6 @@ fn cell_range_mask(start: u8, end: u8) -> u64 {
 
 // 工具函数
 
-fn preallocate_exact<T>(items: &mut Vec<T>, capacity: usize) -> Result<(), SparseQuadError> {
-    if items.capacity() >= capacity {
-        return Ok(());
-    }
-    items
-        .try_reserve_exact(capacity - items.capacity())
-        .map_err(|_| SparseQuadError::AllocationFailed)
-}
-
 fn allocate_exact<T>(items: &mut Vec<T>, additional: usize) -> Result<(), SparseQuadError> {
     if items.capacity().saturating_sub(items.len()) >= additional {
         return Ok(());
@@ -1665,21 +1695,29 @@ fn allocate_more<T>(items: &mut Vec<T>, additional: usize) -> Result<(), SparseQ
         .map_err(|_| SparseQuadError::AllocationFailed)
 }
 
-const fn reserve_exact<T>(items: &Vec<T>, additional: usize) -> Result<(), SparseQuadError> {
+const fn reserve_exact<T: Copy, const N: usize>(
+    items: &FixedVec<T, N>,
+    additional: usize,
+) -> Result<(), SparseQuadError> {
     if items.capacity().saturating_sub(items.len()) >= additional {
         return Ok(());
     }
     Err(SparseQuadError::CapacityOverflow)
 }
 
-const fn reserve_one<T>(items: &Vec<T>) -> Result<(), SparseQuadError> {
+const fn reserve_one<T: Copy, const N: usize>(
+    items: &FixedVec<T, N>,
+) -> Result<(), SparseQuadError> {
     if items.len() < items.capacity() {
         return Ok(());
     }
     Err(SparseQuadError::CapacityOverflow)
 }
 
-const fn reserve_more<T>(items: &Vec<T>, additional: usize) -> Result<(), SparseQuadError> {
+const fn reserve_more<T: Copy, const N: usize>(
+    items: &FixedVec<T, N>,
+    additional: usize,
+) -> Result<(), SparseQuadError> {
     if items.capacity().saturating_sub(items.len()) >= additional {
         return Ok(());
     }
@@ -1693,7 +1731,11 @@ const fn mesh_capacity(item_count: usize, per_item: usize) -> Result<usize, Spar
     }
 }
 
-fn emit(active: ActiveRect, y_end: u8, result: &mut Vec<Rectangle>) -> Result<(), SparseQuadError> {
+fn emit(
+    active: ActiveRect,
+    y_end: u8,
+    result: &mut FixedVec<Rectangle, MAX_RECTANGLES>,
+) -> Result<(), SparseQuadError> {
     reserve_one(result)?;
     result.push(Rectangle {
         value: active.value,
@@ -1776,20 +1818,15 @@ mod tests {
     }
 
     #[test]
-    fn borrowed_decompose_requires_preallocated_scratch() {
+    fn new_scratch_is_ready_for_borrowed_decomposition() {
         let mut scratch = SparseOptimalScratch64::new();
-        assert_eq!(
-            scratch.decompose_borrowed(&[]),
-            Err(SparseQuadError::CapacityOverflow)
-        );
+        assert_eq!(scratch.decompose_borrowed(&[]), Ok([].as_slice()));
     }
 
     #[test]
-    fn preallocated_borrowed_decompose_outputs_slice() {
+    fn inline_borrowed_decompose_outputs_slice() {
         let leaves = [leaf(0, 0, 6, nz(5))];
-        let Some(mut scratch) = ok(SparseOptimalScratch64::try_new_preallocated()) else {
-            return;
-        };
+        let mut scratch = SparseOptimalScratch64::new();
         let Some(rectangles) = ok(scratch.decompose_borrowed(&leaves)) else {
             return;
         };
@@ -1801,9 +1838,7 @@ mod tests {
         let leaves: Vec<_> = (0..EDGE_U8)
             .flat_map(|v| (0..EDGE_U8).map(move |u| leaf(u, v, 0, NonZeroU16::MIN)))
             .collect();
-        let Some(mut scratch) = ok(SparseOptimalScratch64::try_new_preallocated()) else {
-            return;
-        };
+        let mut scratch = SparseOptimalScratch64::new();
         let Some(rectangles) = ok(scratch.decompose_borrowed(&leaves)) else {
             return;
         };
@@ -1820,9 +1855,7 @@ mod tests {
     #[test]
     fn overfull_row_reports_overlap() {
         let leaves = [leaf(0, 0, 0, NonZeroU16::MIN); EDGE + 1];
-        let Some(mut scratch) = ok(SparseOptimalScratch64::try_new_preallocated()) else {
-            return;
-        };
+        let mut scratch = SparseOptimalScratch64::new();
         assert_eq!(
             scratch.decompose_borrowed(&leaves),
             Err(SparseQuadError::Overlap)
@@ -1831,9 +1864,7 @@ mod tests {
 
     #[test]
     fn repeated_decomposition_clears_buckets() {
-        let Some(mut scratch) = ok(SparseOptimalScratch64::try_new_preallocated()) else {
-            return;
-        };
+        let mut scratch = SparseOptimalScratch64::new();
         let _ = ok(scratch.decompose_borrowed(&[leaf(0, 0, ROOT_LOD, NonZeroU16::MIN)]));
         assert!(matches!(scratch.decompose_borrowed(&[]), Ok([])));
     }
@@ -1968,9 +1999,7 @@ mod tests {
                 }
             }
         }
-        let Some(mut scratch) = ok(SparseOptimalScratch64::try_new_preallocated()) else {
-            return;
-        };
+        let mut scratch = SparseOptimalScratch64::new();
         let Some(rectangles) = ok(scratch.decompose_borrowed(&leaves)) else {
             return;
         };
@@ -1993,5 +2022,64 @@ mod tests {
             };
             assert_eq!(profile.counts.rectangles, 12);
         }
+    }
+
+    #[test]
+    fn alternating_holes_reach_both_chord_capacity_bounds() {
+        let leaves: Vec<_> = (0..EDGE_U8)
+            .flat_map(|v| {
+                (0..EDGE_U8)
+                    .filter(move |&u| u % 2 != 0 || v % 2 != 0)
+                    .map(move |u| leaf(u, v, 0, NonZeroU16::MIN))
+            })
+            .collect();
+        let mut scratch = SparseOptimalScratch64::new();
+        let Some(rectangles) = ok(scratch.decompose_borrowed(&leaves)) else {
+            return;
+        };
+        assert_eq!(rectangles.len(), 1025);
+        for chords in [
+            &scratch.chord_groups.horizontal,
+            &scratch.chord_groups.vertical,
+        ] {
+            assert_eq!(chords.len(), crate::matching::IMAGE64_MAX_CHORDS);
+            assert_eq!(chords.len(), chords.capacity());
+        }
+        let Some(image) = ok(SparseQuadImage64::from_leaves(&leaves)) else {
+            return;
+        };
+        let Some(event_rectangles) = ok(scratch.decompose_quads_borrowed(&image)) else {
+            return;
+        };
+        assert_eq!(event_rectangles.len(), 1025);
+        for rectangle in event_rectangles {
+            for y in rectangle.y.start..rectangle.y.end {
+                for x in rectangle.x.start..rectangle.x.end {
+                    assert!(x % 2 != 0 || y % 2 != 0);
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn many_four_pixel_colors_keep_independent_groups() {
+        let mut leaves = Vec::new();
+        for row in 0..32u8 {
+            for column in 0..21u8 {
+                let value = nz(u16::from(row) * 21 + u16::from(column) + 1);
+                // 四像素 S 形，每种颜色恰好产生一条水平 chord。
+                for (u, v) in [(1, 0), (2, 0), (0, 1), (1, 1)] {
+                    leaves.push(leaf(column * 3 + u, row * 2 + v, 0, value));
+                }
+            }
+        }
+        let mut scratch = SparseOptimalScratch64::new();
+        let Some(rectangles) = ok(scratch.decompose_borrowed(&leaves)) else {
+            return;
+        };
+        assert_eq!(rectangles.len(), 2 * 32 * 21);
+        assert_eq!(scratch.chord_groups.groups.len(), 32 * 21);
+        assert_eq!(scratch.chord_groups.horizontal.len(), 32 * 21);
+        assert!(scratch.chord_groups.vertical.is_empty());
     }
 }
