@@ -1,5 +1,7 @@
-//! 固定 64x64 sparse quad 输入的矩形分解，基于 Imai & Asano (1986)
-//! 的 chord-and-matching 归约。
+//! 将 64x64 带标签像素区域分解为最少同色矩形，输入使用 sparse quad 列表。
+//!
+//! 几何归约参考 Ferrari、Sankar、Sklansky (1984)，匹配使用 HKDW。
+//! 算法原理、实现地图与完整出处见仓库 README 和 docs/。
 
 #[cfg(test)]
 mod corners;
