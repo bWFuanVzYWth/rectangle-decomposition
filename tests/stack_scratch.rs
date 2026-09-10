@@ -6,7 +6,9 @@ use std::cell::Cell;
 use std::hint::black_box;
 use std::num::NonZeroU16;
 
-use rectangle_decomposition::{QuadLeaf64, SparseOptimalScratch64, SparseQuadError};
+use rectangle_decomposition::{
+    QuadLeaf64, SparseOptimalScratch64, SparseQuadError, SparseQuadImage64,
+};
 
 thread_local! {
     static TRACK: Cell<bool> = const { Cell::new(false) };
@@ -105,6 +107,42 @@ fn construction_and_reused_borrowed_output_do_not_allocate() -> Result<(), Spars
             assert!(output_end <= scratch_start + std::mem::size_of_val(&scratch));
         }
         assert!(scratch.decompose_borrowed(&[])?.is_empty());
+    }
+    finish_tracking();
+    Ok(())
+}
+
+#[test]
+fn prepared_images_and_leaves_share_scratch_without_allocating() -> Result<(), SparseQuadError> {
+    let fragmented =
+        [(0, 0, 0), (1, 0, 0), (1, 1, 0), (2, 1, 0), (8, 8, 1)].map(|(u, v, lod)| QuadLeaf64 {
+            u,
+            v,
+            lod,
+            value: NonZeroU16::MIN,
+        });
+    let full = [QuadLeaf64 {
+        u: 0,
+        v: 0,
+        lod: 6,
+        value: NonZeroU16::MAX,
+    }];
+    // 拥有型 image 的构造独立分配；只统计 scratch 和两种借用分解入口。
+    let fragmented_image = SparseQuadImage64::from_leaves(&fragmented)?;
+    let full_image = SparseQuadImage64::from_leaves(&full)?;
+    let empty_image = SparseQuadImage64::from_leaves(&[])?;
+    start_tracking();
+    {
+        let mut scratch = SparseOptimalScratch64::new();
+        for (leaves, image, count) in [
+            (fragmented.as_slice(), &fragmented_image, 3),
+            (&[], &empty_image, 0),
+            (full.as_slice(), &full_image, 1),
+            (fragmented.as_slice(), &fragmented_image, 3),
+        ] {
+            assert_eq!(scratch.decompose_quads_borrowed(image)?.len(), count);
+            assert_eq!(scratch.decompose_borrowed(leaves)?.len(), count);
+        }
     }
     finish_tracking();
     Ok(())

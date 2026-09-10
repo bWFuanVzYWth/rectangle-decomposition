@@ -1,13 +1,12 @@
 //! 固定 64x64 sparse quad 输入的矩形分解。
 //!
-//! 输入为非零 dyadic square 列表，内部派生事件、区间、chord 与 cut，
+//! 输入为非零 dyadic square 列表，内部派生区间、chord 与 cut，
 //! 不创建 dense 像素图。
 
 use std::num::NonZeroU16;
 #[cfg(feature = "profile")]
 use std::time::{Duration, Instant};
 
-use crate::corners::{Corners, horizontal_support_from_corners, vertical_support_from_corners};
 use crate::fixed::FixedVec;
 use crate::matching::{ChordBuffer, MatchingScratch};
 use crate::types::{ActiveRect, ChordAccess, EffectiveChord, Orientation, RangeU8, Rectangle, Run};
@@ -17,7 +16,6 @@ const EDGE: usize = 64;
 const EDGE_U8: u8 = 64;
 const MAX_LOD: u8 = 6;
 const MAX_AXIS_INTERVALS: usize = EDGE * EDGE;
-const MAX_AXIS_EVENTS: usize = MAX_AXIS_INTERVALS * 2;
 // 每个有 chord 的颜色至少占 4 个像素；不同颜色不能共享像素。
 const MAX_CHORD_GROUPS: usize = EDGE * EDGE / 4;
 const MAX_RECTANGLES: usize = EDGE * EDGE;
@@ -77,6 +75,7 @@ pub struct SparseDecomposeTimings {
     pub matching_cover: Duration,
     pub matching_collect: Duration,
     pub emit_cuts: Duration,
+    /// 兼容旧版 profiling 字段；切线直接合入位图，无需排序，始终为零。
     pub sort_cuts: Duration,
     pub partition: Duration,
 }
@@ -118,7 +117,6 @@ struct SelectCutTimings {
     matching_cover: Duration,
     matching_collect: Duration,
     emit_cuts: Duration,
-    sort_cuts: Duration,
     greedy_matches: usize,
     matching_phases: usize,
     matching_augmentations: usize,
@@ -182,14 +180,10 @@ impl SparseQuadImage64 {
 ///
 /// 可以放在 worker 栈上复用；对象较大，调用时传递 `&mut`，避免按值传递。
 pub struct SparseOptimalScratch64 {
-    row_events: FixedVec<AxisEvent, MAX_AXIS_EVENTS>,
-    column_events: FixedVec<AxisEvent, MAX_AXIS_EVENTS>,
     row_buckets: [IntervalBucket; EDGE],
     column_buckets: [IntervalBucket; EDGE],
     rows: AxisIntervals,
     columns: AxisIntervals,
-    active_intervals: FixedVec<Interval, EDGE>,
-    normalized_intervals: FixedVec<Interval, EDGE>,
     chord_groups: SparseChordGroups,
     matching: MatchingScratch,
     horizontal_cuts: ChordBuffer<HorizontalCut>,
@@ -216,22 +210,10 @@ impl SparseOptimalScratch64 {
     pub const fn new() -> Self {
         const {
             Self {
-                row_events: FixedVec::new(AxisEvent {
-                    coord: 0,
-                    is_end: false,
-                    interval: EMPTY_INTERVAL,
-                }),
-                column_events: FixedVec::new(AxisEvent {
-                    coord: 0,
-                    is_end: false,
-                    interval: EMPTY_INTERVAL,
-                }),
                 row_buckets: [const { IntervalBucket::new() }; EDGE],
                 column_buckets: [const { IntervalBucket::new() }; EDGE],
                 rows: AxisIntervals::new(),
                 columns: AxisIntervals::new(),
-                active_intervals: FixedVec::new(EMPTY_INTERVAL),
-                normalized_intervals: FixedVec::new(EMPTY_INTERVAL),
                 chord_groups: SparseChordGroups::new(),
                 matching: MatchingScratch::new(),
                 horizontal_cuts: FixedVec::new(HorizontalCut {
@@ -304,7 +286,7 @@ impl SparseOptimalScratch64 {
         leaves: &[QuadLeaf64],
     ) -> Result<&[Rectangle], SparseQuadError> {
         build_axis_intervals_from_leaves(
-            leaves,
+            leaves.iter().copied(),
             &mut self.rows,
             &mut self.columns,
             &mut self.row_buckets,
@@ -328,7 +310,7 @@ impl SparseOptimalScratch64 {
         let total_start = Instant::now();
         let axis_start = Instant::now();
         build_axis_intervals_from_leaves(
-            leaves,
+            leaves.iter().copied(),
             &mut self.rows,
             &mut self.columns,
             &mut self.row_buckets,
@@ -375,7 +357,7 @@ impl SparseOptimalScratch64 {
                 matching_cover: select_timings.matching_cover,
                 matching_collect: select_timings.matching_collect,
                 emit_cuts: select_timings.emit_cuts,
-                sort_cuts: select_timings.sort_cuts,
+                sort_cuts: Duration::ZERO,
                 partition,
             },
             counts: SparseDecomposeCounts {
@@ -411,29 +393,13 @@ impl SparseOptimalScratch64 {
         &mut self,
         image: &SparseQuadImage64,
     ) -> Result<&[Rectangle], SparseQuadError> {
-        build_axis_events(image, &mut self.row_events, &mut self.column_events)?;
-        self.decompose_events_borrowed(false)
-    }
-
-    fn decompose_events_borrowed(
-        &mut self,
-        validate_row_overlap: bool,
-    ) -> Result<&[Rectangle], SparseQuadError> {
-        build_axis_intervals(
-            &mut self.row_events,
+        build_axis_intervals_from_leaves(
+            image.leaves.iter().map(|stored| stored.leaf),
             &mut self.rows,
-            &mut self.active_intervals,
-            &mut self.normalized_intervals,
-            validate_row_overlap,
-        )?;
-        build_axis_intervals(
-            &mut self.column_events,
             &mut self.columns,
-            &mut self.active_intervals,
-            &mut self.normalized_intervals,
-            false,
+            &mut self.row_buckets,
+            &mut self.column_buckets,
         )?;
-
         self.decompose_intervals_borrowed()
     }
 
@@ -489,8 +455,6 @@ impl SparseOptimalScratch64 {
             }
         }
 
-        horizontal_cuts.sort_unstable_by_key(|cut| (cut.y, cut.start, cut.end));
-        vertical_cuts.sort_unstable_by_key(|cut| (cut.start, cut.end, cut.x));
         Ok(())
     }
 
@@ -551,10 +515,6 @@ impl SparseOptimalScratch64 {
             timings.emit_cuts += emit_start.elapsed();
         }
 
-        let sort_start = Instant::now();
-        horizontal_cuts.sort_unstable_by_key(|cut| (cut.y, cut.start, cut.end));
-        vertical_cuts.sort_unstable_by_key(|cut| (cut.start, cut.end, cut.x));
-        timings.sort_cuts = sort_start.elapsed();
         Ok(timings)
     }
 
@@ -773,13 +733,6 @@ struct LineInterval {
     interval: Interval,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct AxisEvent {
-    coord: u8,
-    is_end: bool,
-    interval: Interval,
-}
-
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
 struct LineRange {
     start: usize,
@@ -813,76 +766,10 @@ impl AxisIntervals {
     }
 }
 
-// 轴事件构造
-
-fn build_axis_events(
-    image: &SparseQuadImage64,
-    row_events: &mut FixedVec<AxisEvent, MAX_AXIS_EVENTS>,
-    column_events: &mut FixedVec<AxisEvent, MAX_AXIS_EVENTS>,
-) -> Result<(), SparseQuadError> {
-    row_events.clear();
-    column_events.clear();
-
-    let event_count = mesh_capacity(image.leaves.len(), 2)?;
-    reserve_exact(row_events, event_count)?;
-    reserve_exact(column_events, event_count)?;
-
-    for stored in &image.leaves {
-        let leaf = stored.leaf;
-        let size = quad_size(leaf.lod);
-        push_axis_events(leaf, size, row_events, column_events);
-    }
-
-    Ok(())
-}
-
-fn push_axis_events(
-    leaf: QuadLeaf64,
-    size: u8,
-    row_events: &mut FixedVec<AxisEvent, MAX_AXIS_EVENTS>,
-    column_events: &mut FixedVec<AxisEvent, MAX_AXIS_EVENTS>,
-) {
-    let u1 = leaf.u + size;
-    let v1 = leaf.v + size;
-    let value = leaf.value.get();
-
-    let row_interval = Interval {
-        start: leaf.u,
-        end: u1,
-        value,
-    };
-    row_events.push(AxisEvent {
-        coord: leaf.v,
-        is_end: false,
-        interval: row_interval,
-    });
-    row_events.push(AxisEvent {
-        coord: v1,
-        is_end: true,
-        interval: row_interval,
-    });
-
-    let column_interval = Interval {
-        start: leaf.v,
-        end: v1,
-        value,
-    };
-    column_events.push(AxisEvent {
-        coord: leaf.u,
-        is_end: false,
-        interval: column_interval,
-    });
-    column_events.push(AxisEvent {
-        coord: u1,
-        is_end: true,
-        interval: column_interval,
-    });
-}
-
 // 从 leaves 构造轴区间
 
 fn build_axis_intervals_from_leaves(
-    leaves: &[QuadLeaf64],
+    leaves: impl IntoIterator<Item = QuadLeaf64>,
     rows: &mut AxisIntervals,
     columns: &mut AxisIntervals,
     row_buckets: &mut [IntervalBucket; EDGE],
@@ -890,7 +777,9 @@ fn build_axis_intervals_from_leaves(
 ) -> Result<(), SparseQuadError> {
     prepare_interval_buckets(row_buckets);
     prepare_interval_buckets(column_buckets);
-    push_leaf_axis_intervals(leaves, row_buckets, column_buckets)?;
+    for leaf in leaves {
+        push_leaf_axis_intervals_one(leaf, row_buckets, column_buckets)?;
+    }
 
     build_axis_intervals_from_buckets(row_buckets, rows, true)?;
     build_axis_intervals_from_buckets(column_buckets, columns, false)
@@ -900,17 +789,6 @@ fn prepare_interval_buckets(buckets: &mut [IntervalBucket; EDGE]) {
     for bucket in buckets {
         bucket.len = 0;
     }
-}
-
-fn push_leaf_axis_intervals(
-    leaves: &[QuadLeaf64],
-    row_buckets: &mut [IntervalBucket],
-    column_buckets: &mut [IntervalBucket],
-) -> Result<(), SparseQuadError> {
-    for &leaf in leaves {
-        push_leaf_axis_intervals_one(leaf, row_buckets, column_buckets)?;
-    }
-    Ok(())
 }
 
 fn push_leaf_line_intervals(
@@ -1050,57 +928,6 @@ fn build_axis_intervals_from_buckets(
     Ok(())
 }
 
-fn build_axis_intervals(
-    events: &mut [AxisEvent],
-    output: &mut AxisIntervals,
-    active: &mut FixedVec<Interval, EDGE>,
-    normalized: &mut FixedVec<Interval, EDGE>,
-    validate_overlap: bool,
-) -> Result<(), SparseQuadError> {
-    events.sort_unstable_by_key(|event| (event.coord, !event.is_end));
-    output.clear_for_build()?;
-    active.clear();
-    normalized.clear();
-
-    let mut cursor = 0usize;
-    for line in 0..EDGE {
-        let line_coord = u8::try_from(line).map_err(|_| SparseQuadError::CapacityOverflow)?;
-        while let Some(event) = events
-            .get(cursor)
-            .copied()
-            .filter(|event| event.coord == line_coord)
-        {
-            if event.is_end {
-                remove_active_interval(active, event.interval);
-            } else {
-                active.push(event.interval);
-            }
-            cursor += 1;
-        }
-
-        normalized.clear();
-        reserve_exact(normalized, active.len())?;
-        normalized.extend_from_slice(active);
-        normalized.sort_unstable_by_key(|interval| interval.start);
-        if validate_overlap {
-            validate_non_overlapping_line(normalized)?;
-        }
-
-        let start = output.intervals.len();
-        reserve_exact(&output.intervals, normalized.len())?;
-        for &interval in normalized.as_slice() {
-            push_merged_interval(&mut output.intervals, start, interval)?;
-        }
-        let end = output.intervals.len();
-        let Some(slot) = output.lines.get_mut(line) else {
-            return Err(SparseQuadError::CapacityOverflow);
-        };
-        *slot = LineRange { start, end };
-    }
-
-    Ok(())
-}
-
 fn push_merged_interval(
     output: &mut FixedVec<Interval, MAX_AXIS_INTERVALS>,
     line_start: usize,
@@ -1129,13 +956,6 @@ fn validate_non_overlapping_line(intervals: &[Interval]) -> Result<(), SparseQua
         previous_end = Some(interval.end);
     }
     Ok(())
-}
-
-fn remove_active_interval(active: &mut FixedVec<Interval, EDGE>, interval: Interval) {
-    let Some(position) = active.iter().position(|&item| item == interval) else {
-        std::process::abort();
-    };
-    active.swap_remove(position);
 }
 
 // Chord 提取
@@ -1210,8 +1030,10 @@ impl SparseChordGroups {
     }
 
     fn finish(&mut self) -> Result<(), SparseQuadError> {
-        sort_valued_chords(&mut self.horizontal);
-        sort_valued_chords(&mut self.vertical);
+        self.horizontal
+            .sort_unstable_by_key(|item| (item.value, item.order));
+        self.vertical
+            .sort_unstable_by_key(|item| (item.value, item.order));
         self.groups.clear();
 
         let (mut horizontal_index, mut vertical_index) = (0usize, 0usize);
@@ -1266,22 +1088,6 @@ impl SparseChordGroups {
     }
 }
 
-fn sort_valued_chords(chords: &mut [ValuedChord]) {
-    let mut previous = match chords.first() {
-        Some(first) => (first.value, first.order),
-        None => return,
-    };
-
-    for chord in chords.iter().skip(1) {
-        let key = (chord.value, chord.order);
-        if previous > key {
-            chords.sort_unstable_by_key(|item| (item.value, item.order));
-            return;
-        }
-        previous = key;
-    }
-}
-
 fn extract_sparse_chords(
     rows: &AxisIntervals,
     columns: &AxisIntervals,
@@ -1308,197 +1114,74 @@ fn extract_sparse_chords(
     Ok(())
 }
 
-fn emit_horizontal_chords_for_boundary(
-    upper: &[Interval],
-    lower: &[Interval],
-    y: u8,
-    groups: &mut SparseChordGroups,
+/// 输入是已合并的最大同色区间。
+/// 两段同色且相交时，起点不等意味着交集左侧恰有一个同色像素，即凹角；
+/// 终点不等给出另一端的凹角。无需重新查询相邻像素。
+fn emit_chords_for_boundary(
+    first: &[Interval],
+    second: &[Interval],
+    mut emit: impl FnMut(Interval) -> Result<(), SparseQuadError>,
 ) -> Result<(), SparseQuadError> {
-    let (mut upper_index, mut lower_index) = (0usize, 0usize);
-    while upper_index < upper.len() && lower_index < lower.len() {
-        let (Some(&a), Some(&b)) = (upper.get(upper_index), lower.get(lower_index)) else {
-            break;
-        };
+    let (mut i, mut j) = (0, 0);
+    while let (Some(&a), Some(&b)) = (first.get(i), second.get(j)) {
         let start = a.start.max(b.start);
         let end = a.end.min(b.end);
-        if a.value == b.value && start < end {
-            try_emit_horizontal_chord(
-                LineCursor {
-                    intervals: upper,
-                    index: upper_index,
-                },
-                LineCursor {
-                    intervals: lower,
-                    index: lower_index,
-                },
-                y,
+        if a.value == b.value && a.start != b.start && a.end != b.end && start < end {
+            emit(Interval {
                 start,
                 end,
-                a.value,
-                groups,
-            )?;
+                value: a.value,
+            })?;
         }
         if a.end <= b.end {
-            upper_index += 1;
-        } else {
-            lower_index += 1;
+            i += 1;
+        }
+        // 终点相同时两段都耗尽，直接同时推进，避免再扫描一个空交集。
+        if b.end <= a.end {
+            j += 1;
         }
     }
     Ok(())
 }
 
-#[derive(Clone, Copy)]
-struct LineCursor<'a> {
-    intervals: &'a [Interval],
-    index: usize,
-}
-
-fn try_emit_horizontal_chord(
-    upper: LineCursor<'_>,
-    lower: LineCursor<'_>,
+fn emit_horizontal_chords_for_boundary(
+    first: &[Interval],
+    second: &[Interval],
     y: u8,
-    start: u8,
-    end: u8,
-    value: u16,
     groups: &mut SparseChordGroups,
 ) -> Result<(), SparseQuadError> {
-    let left_upper = start > 0 && value_at_cursor(upper, start - 1) == value;
-    let left_lower = start > 0 && value_at_cursor(lower, start - 1) == value;
-    let Some((supports_right, _)) =
-        horizontal_support_from_corners(Corners::from_flags([left_upper, true, left_lower, true]))
-    else {
-        return Ok(());
-    };
-    if !supports_right {
-        return Ok(());
-    }
-
-    let right_upper = end < EDGE_U8 && value_at_cursor(upper, end) == value;
-    let right_lower = end < EDGE_U8 && value_at_cursor(lower, end) == value;
-    let Some((_, supports_left)) = horizontal_support_from_corners(Corners::from_flags([
-        true,
-        right_upper,
-        true,
-        right_lower,
-    ])) else {
-        return Ok(());
-    };
-    if supports_left {
+    emit_chords_for_boundary(first, second, |interval| {
         groups.add_horizontal(
-            value,
+            interval.value,
             EffectiveChord {
                 orientation: Orientation::Horizontal,
-                x1: start,
+                x1: interval.start,
                 y1: y,
-                x2: end,
+                x2: interval.end,
                 y2: y,
             },
-        )?;
-    }
-    Ok(())
+        )
+    })
 }
 
 fn emit_vertical_chords_for_boundary(
-    left: &[Interval],
-    right: &[Interval],
+    first: &[Interval],
+    second: &[Interval],
     x: u8,
     groups: &mut SparseChordGroups,
 ) -> Result<(), SparseQuadError> {
-    let (mut left_index, mut right_index) = (0usize, 0usize);
-    while left_index < left.len() && right_index < right.len() {
-        let (Some(&a), Some(&b)) = (left.get(left_index), right.get(right_index)) else {
-            break;
-        };
-        let start = a.start.max(b.start);
-        let end = a.end.min(b.end);
-        if a.value == b.value && start < end {
-            try_emit_vertical_chord(
-                LineCursor {
-                    intervals: left,
-                    index: left_index,
-                },
-                LineCursor {
-                    intervals: right,
-                    index: right_index,
-                },
-                x,
-                start,
-                end,
-                a.value,
-                groups,
-            )?;
-        }
-        if a.end <= b.end {
-            left_index += 1;
-        } else {
-            right_index += 1;
-        }
-    }
-    Ok(())
-}
-
-fn try_emit_vertical_chord(
-    left: LineCursor<'_>,
-    right: LineCursor<'_>,
-    x: u8,
-    start: u8,
-    end: u8,
-    value: u16,
-    groups: &mut SparseChordGroups,
-) -> Result<(), SparseQuadError> {
-    let top_left = start > 0 && value_at_cursor(left, start - 1) == value;
-    let top_right = start > 0 && value_at_cursor(right, start - 1) == value;
-    let Some((supports_down, _)) =
-        vertical_support_from_corners(Corners::from_flags([top_left, top_right, true, true]))
-    else {
-        return Ok(());
-    };
-    if !supports_down {
-        return Ok(());
-    }
-
-    let bottom_left = end < EDGE_U8 && value_at_cursor(left, end) == value;
-    let bottom_right = end < EDGE_U8 && value_at_cursor(right, end) == value;
-    let Some((_, supports_up)) =
-        vertical_support_from_corners(Corners::from_flags([true, true, bottom_left, bottom_right]))
-    else {
-        return Ok(());
-    };
-    if supports_up {
+    emit_chords_for_boundary(first, second, |interval| {
         groups.add_vertical(
-            value,
+            interval.value,
             EffectiveChord {
                 orientation: Orientation::Vertical,
                 x1: x,
-                y1: start,
+                y1: interval.start,
                 x2: x,
-                y2: end,
+                y2: interval.end,
             },
-        )?;
-    }
-    Ok(())
-}
-
-fn value_at_cursor(cursor: LineCursor<'_>, coord: u8) -> u16 {
-    let Some(interval) = cursor.intervals.get(cursor.index) else {
-        return 0;
-    };
-    if interval.start <= coord && coord < interval.end {
-        return interval.value;
-    }
-    if coord < interval.start {
-        return cursor
-            .index
-            .checked_sub(1)
-            .and_then(|index| cursor.intervals.get(index))
-            .filter(|candidate| candidate.start <= coord && coord < candidate.end)
-            .map_or(0, |candidate| candidate.value);
-    }
-    cursor
-        .intervals
-        .get(cursor.index + 1)
-        .filter(|candidate| candidate.start <= coord && coord < candidate.end)
-        .map_or(0, |candidate| candidate.value)
+        )
+    })
 }
 
 // Cut / 分区类型
@@ -1525,6 +1208,7 @@ fn build_cut_masks(
     horizontal_masks: &mut FixedVec<u64, EDGE>,
     vertical_masks: &mut FixedVec<u128, EDGE>,
 ) -> Result<(), SparseQuadError> {
+    // 位图用 OR 合并，切线顺序无关；无需在收集后排序。
     horizontal_masks.clear();
     horizontal_masks.resize(EDGE, 0);
     vertical_masks.clear();
@@ -1563,7 +1247,7 @@ fn build_runs_for_row(
                 interval.start.saturating_add(1),
                 interval.end.saturating_sub(1),
             );
-        reserve_more(runs, split_mask.count_ones() as usize + 1)?;
+        reserve_exact(runs, split_mask.count_ones() as usize + 1)?;
         while split_mask != 0 {
             let split = u8::try_from(split_mask.trailing_zeros())
                 .map_err(|_| SparseQuadError::CapacityOverflow)?;
@@ -1637,7 +1321,7 @@ fn merge_sparse_runs(
         emit(active_rect, y, result)?;
     }
 
-    reserve_more(next_active, runs.len().saturating_sub(run_index))?;
+    reserve_exact(next_active, runs.len().saturating_sub(run_index))?;
     let Some(remaining_runs) = runs.get(run_index..) else {
         return Err(SparseQuadError::CapacityOverflow);
     };
@@ -1712,23 +1396,6 @@ const fn reserve_one<T: Copy, const N: usize>(
         return Ok(());
     }
     Err(SparseQuadError::CapacityOverflow)
-}
-
-const fn reserve_more<T: Copy, const N: usize>(
-    items: &FixedVec<T, N>,
-    additional: usize,
-) -> Result<(), SparseQuadError> {
-    if items.capacity().saturating_sub(items.len()) >= additional {
-        return Ok(());
-    }
-    Err(SparseQuadError::CapacityOverflow)
-}
-
-const fn mesh_capacity(item_count: usize, per_item: usize) -> Result<usize, SparseQuadError> {
-    match item_count.checked_mul(per_item) {
-        Some(capacity) => Ok(capacity),
-        None => Err(SparseQuadError::CapacityOverflow),
-    }
 }
 
 fn emit(
@@ -2081,5 +1748,96 @@ mod tests {
         assert_eq!(scratch.chord_groups.groups.len(), 32 * 21);
         assert_eq!(scratch.chord_groups.horizontal.len(), 32 * 21);
         assert!(scratch.chord_groups.vertical.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::indexing_slicing)] // 穷举固定的两个四像素行，所有访问由 0..4 界定。
+    fn interval_chords_match_pixel_corner_oracle() {
+        use crate::corners::{Corners, horizontal_support_from_corners};
+
+        fn intervals(pixels: [u16; 4], origin: u8) -> Vec<Interval> {
+            let mut output = Vec::<Interval>::new();
+            for (x, value) in (origin..origin + 4).zip(pixels) {
+                if value == 0 {
+                    continue;
+                }
+                if let Some(last) = output.last_mut()
+                    && last.value == value
+                    && last.end == x
+                {
+                    last.end = x + 1;
+                } else {
+                    output.push(Interval {
+                        start: x,
+                        end: x + 1,
+                        value,
+                    });
+                }
+            }
+            output
+        }
+
+        // 两行、每像素背景或两种颜色，覆盖全部 3^8 种组合；分别贴左右图边界。
+        for mut encoded in 0..3usize.pow(8) {
+            let mut first = [0u16; 4];
+            let mut second = [0u16; 4];
+            for pixel in first.iter_mut().chain(&mut second) {
+                *pixel = crate::u16_index(encoded % 3);
+                encoded /= 3;
+            }
+            for origin in [0u8, 60] {
+                let mut expected = Vec::new();
+                for start in 0u8..4 {
+                    let s = usize::from(start);
+                    let value = first[s];
+                    if value == 0 {
+                        continue;
+                    }
+                    for end in start + 1..=4 {
+                        let e = usize::from(end);
+                        if !first[s..e].iter().chain(&second[s..e]).all(|&v| v == value) {
+                            continue;
+                        }
+                        let left = Corners::from_flags([
+                            s > 0 && first[s - 1] == value,
+                            true,
+                            s > 0 && second[s - 1] == value,
+                            true,
+                        ]);
+                        let right = Corners::from_flags([
+                            true,
+                            e < 4 && first[e] == value,
+                            true,
+                            e < 4 && second[e] == value,
+                        ]);
+                        if matches!(horizontal_support_from_corners(left), Some((true, _)))
+                            && matches!(horizontal_support_from_corners(right), Some((_, true)))
+                        {
+                            expected.push(Interval {
+                                start: origin + start,
+                                end: origin + end,
+                                value,
+                            });
+                        }
+                    }
+                }
+                let mut actual = Vec::new();
+                assert!(
+                    emit_chords_for_boundary(
+                        &intervals(first, origin),
+                        &intervals(second, origin),
+                        |chord| {
+                            actual.push(chord);
+                            Ok(())
+                        },
+                    )
+                    .is_ok()
+                );
+                assert_eq!(
+                    actual, expected,
+                    "first={first:?}, second={second:?}, origin={origin}"
+                );
+            }
+        }
     }
 }

@@ -1,6 +1,7 @@
 //! 固定 64x64 sparse quad 输入的矩形分解，基于 Imai & Asano (1986)
 //! 的 chord-and-matching 归约。
 
+#[cfg(test)]
 mod corners;
 mod fixed;
 mod graph;

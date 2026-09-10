@@ -77,7 +77,7 @@ pub struct ConflictFinalizeScratch {
     pub(super) adjacency_offsets: FixedVec<usize, { IMAGE64_MAX_CHORDS + 1 }>,
     pub(super) adjacency_edges: FixedVec<u16, IMAGE64_MAX_CONFLICT_EDGES>,
     pub(super) horizontal_grid: [u16; IMAGE64_GRID_POINTS],
-    pub(super) horizontal_grid_marks: [u16; IMAGE64_GRID_POINTS],
+    /// 配合列标记表示本轮已写入的格点，无需再为每个格点保存一份标记。
     pub(super) horizontal_y_masks: [u64; IMAGE64_AXIS_LEN],
     pub(super) horizontal_x_marks: [u16; IMAGE64_AXIS_LEN],
     pub(super) grid_mark: u16,
@@ -99,8 +99,9 @@ impl ConflictFinalizeScratch {
             right_degrees: FixedVec::new(0),
             adjacency_offsets: FixedVec::new(0),
             adjacency_edges: FixedVec::new(0),
-            horizontal_grid: [u16::MAX; IMAGE64_GRID_POINTS],
-            horizontal_grid_marks: [0; IMAGE64_GRID_POINTS],
+            // 仅通过本轮标记和位图读取已写入的槽；初值无需 UNMATCHED。
+            // 全零初值使整个栈 scratch 可由一次 memset 初始化。
+            horizontal_grid: [0; IMAGE64_GRID_POINTS],
             horizontal_y_masks: [0; IMAGE64_AXIS_LEN],
             horizontal_x_marks: [0; IMAGE64_AXIS_LEN],
             grid_mark: 0,

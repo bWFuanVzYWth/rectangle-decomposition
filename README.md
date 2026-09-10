@@ -8,6 +8,7 @@
 - `SparseOptimalScratch64`：固定容量的内联缓存，支持栈上复用；`decompose_borrowed` 返回借用结果。
 - `SparseLayerBuilder64`：逐个加入正方形并完成分解。
 
+Chord 直接由相邻行／列的最大同色区间端点判定，无需重复查询邻近像素。
 匹配后端使用 HKDW（Hopcroft–Karp 的 Duff–Wiberg 变体），冲突图按度数计数排序后
 线性构建有序 CSR。支持含孔区域，保持最少矩形数量；当最优解不唯一时，具体切分可能变化。
 将图像边长推广为 n 时，整体最坏复杂度仍为 O(n³)。详见 [匹配算法说明](docs/matching.md)。
@@ -29,7 +30,7 @@ fn process_layers(layers: &[&[QuadLeaf64]]) -> Result<(), SparseQuadError> {
 }
 ```
 
-当前 x86_64 布局约 470.7 KiB/份；已验证每个 worker 使用 2 MiB 栈的 debug/release 路径。
+当前 x86_64 布局约 366.0 KiB/份；已验证每个 worker 使用 2 MiB 栈的 debug/release 路径。
 调用方仍需为自己的调用链留出栈空间。`new()` 直接得到可用缓存；原 `preallocate_64()`
 保留为兼容空操作，`try_new_preallocated()` 返回 `Ok(new())`。新代码使用 `new()`，避免
 大对象通过 `Result` 和辅助函数按值搬运。详见 [栈 scratch 与容量上界](docs/scratch.md)。

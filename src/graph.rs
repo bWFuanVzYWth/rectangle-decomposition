@@ -118,12 +118,11 @@ fn build_sparse_conflict_graph_grid_csr<H: ChordAccess, V: ChordAccess>(
         debug_assert!((IMAGE64_INTERNAL_MIN..=IMAGE64_INTERNAL_MAX).contains(&y));
         for x in internal_range(horizontal.x1, horizontal.x2) {
             let slot = grid_index(x, y);
-            debug_assert_ne!(
-                copy(&scratch.horizontal_grid_marks, slot),
-                scratch.grid_mark
+            debug_assert!(
+                copy(&scratch.horizontal_x_marks, x) != scratch.grid_mark
+                    || copy(&scratch.horizontal_y_masks, x) & (1u64 << y) == 0
             );
             *get_mut(&mut scratch.horizontal_grid, slot) = u16_index(index);
-            *get_mut(&mut scratch.horizontal_grid_marks, slot) = scratch.grid_mark;
             if copy(&scratch.horizontal_x_marks, x) != scratch.grid_mark {
                 *get_mut(&mut scratch.horizontal_x_marks, x) = scratch.grid_mark;
                 *get_mut(&mut scratch.horizontal_y_masks, x) = 0;
@@ -147,10 +146,6 @@ fn build_sparse_conflict_graph_grid_csr<H: ChordAccess, V: ChordAccess>(
             let y =
                 usize::try_from(active.trailing_zeros()).unwrap_or_else(|_| std::process::abort());
             let slot = grid_index(x, y);
-            debug_assert_eq!(
-                copy(&scratch.horizontal_grid_marks, slot),
-                scratch.grid_mark
-            );
             let left = copy(&scratch.horizontal_grid, slot);
             debug_assert_ne!(left, UNMATCHED_U16);
             push_conflict_edge(
@@ -184,7 +179,6 @@ fn reset_grid_scratch(scratch: &mut ConflictFinalizeScratch) {
     }
 
     scratch.grid_mark = 1;
-    scratch.horizontal_grid_marks.fill(0);
     scratch.horizontal_x_marks.fill(0);
 }
 
@@ -215,6 +209,42 @@ fn internal_mask(start: u8, end: u8) -> u64 {
 mod tests {
     use super::*;
     use crate::matching::MatchingScratch;
+    use crate::types::{EffectiveChord, Orientation};
+
+    #[test]
+    fn zero_initialized_grid_ignores_stale_slots_after_mark_wrap() {
+        let mut scratch = ConflictScratch::default();
+        let vertical = [EffectiveChord {
+            orientation: Orientation::Vertical,
+            x1: 3,
+            y1: 1,
+            x2: 3,
+            y2: 5,
+        }];
+        for (x, y, expected_edges, wrap) in [
+            (1, 2, 1, false),
+            // 回绕后不再写 x=3，旧的 mark=1 和 y=2 位必须失效。
+            (4, 6, 0, true),
+            (1, 2, 1, false),
+            (1, 6, 0, false),
+            (1, 4, 1, false),
+        ] {
+            if wrap {
+                scratch.finalize.grid_mark = u16::MAX;
+            }
+            let horizontal = [EffectiveChord {
+                orientation: Orientation::Horizontal,
+                x1: x,
+                y1: y,
+                x2: 6,
+                y2: y,
+            }];
+            let (graph, degrees) =
+                build_sparse_conflict_graph_csr(&horizontal, &vertical, &mut scratch);
+            assert_eq!(graph.edges.len(), expected_edges);
+            assert_eq!(usize::from(degrees[0]), expected_edges);
+        }
+    }
 
     #[test]
     fn linear_scatter_matches_comparison_sort_with_ties_and_empty_vertices() {

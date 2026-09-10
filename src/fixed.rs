@@ -61,12 +61,6 @@ impl<T: Copy, const N: usize> FixedVec<T, N> {
         self.len = end;
     }
 
-    pub(crate) fn swap_remove(&mut self, index: usize) {
-        let value = copy(self.as_slice(), self.len - 1);
-        *get_mut(self.as_mut_slice(), index) = value;
-        self.len -= 1;
-    }
-
     pub(crate) fn retain(&mut self, mut keep: impl FnMut(&T) -> bool) {
         let mut end = 0;
         for index in 0..self.len {
