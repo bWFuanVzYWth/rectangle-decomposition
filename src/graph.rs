@@ -5,7 +5,7 @@ use crate::matching::{
     IMAGE64_MAX_CONFLICT_EDGES, SparseAdjacencyRef, SparseEdge, UNMATCHED_U16,
 };
 use crate::types::ChordAccess;
-use crate::{copy, get_mut, slice, slice_mut, u16_index, u32_index};
+use crate::{copy, get_mut, slice, u16_index, u32_index};
 
 const IMAGE64_INTERNAL_MIN: usize = 1;
 const IMAGE64_INTERNAL_MAX: usize = IMAGE64_AXIS_LIMIT - 1;
@@ -14,28 +14,8 @@ const fn grid_index(x: usize, y: usize) -> usize {
     y * IMAGE64_AXIS_LEN + x
 }
 
-fn sort_right_slice_by_key(slice: &mut [u16], right_keys: &[u32]) {
-    if slice.len() <= 1 {
-        return;
-    }
-
-    if slice.len() <= 48 {
-        for index in 1..slice.len() {
-            let value = copy(slice, index);
-            let value_key = copy(right_keys, usize::from(value));
-            let mut cursor = index;
-            while cursor > 0 && copy(right_keys, usize::from(copy(slice, cursor - 1))) > value_key {
-                *get_mut(slice, cursor) = copy(slice, cursor - 1);
-                cursor -= 1;
-            }
-            *get_mut(slice, cursor) = value;
-        }
-        return;
-    }
-
-    slice.sort_unstable_by_key(|&right| copy(right_keys, usize::from(right)));
-}
-
+/// 利用按右顶点连续分组的 `edge_buffer`，在线性时间内构建有序左 CSR。
+/// 每个左邻接表仍按 (右顶点度数, 右顶点编号) 排序。
 pub fn build_sparse_adjacency_in_scratch(
     left_size: usize,
     right_size: usize,
@@ -61,23 +41,42 @@ pub fn build_sparse_adjacency_in_scratch(
     scratch.adjacency_edges.clear();
     scratch.adjacency_edges.resize(edges.len(), 0);
     let compact_edges = &mut scratch.adjacency_edges;
-    for edge in edges {
-        let left = usize::from(edge.left);
-        let slot = copy(&scratch.next_offsets, left);
-        *get_mut(compact_edges, slot) = edge.right;
-        *get_mut(&mut scratch.next_offsets, left) += 1;
-    }
-
-    scratch.right_keys.clear();
-    scratch.right_keys.resize(right_size, 0);
+    scratch.right_layout.clear();
+    scratch.right_layout.resize(2 * right_size, 0);
+    let layout = &mut scratch.right_layout;
+    let mut degree_offsets = [0usize; IMAGE64_AXIS_LIMIT];
+    let mut edge_start = 0usize;
     for (right, &degree) in right_degrees.iter().enumerate() {
-        *get_mut(&mut scratch.right_keys, right) = (u32::from(degree) << 16) | u32_index(right);
+        *get_mut(layout, right) = u32_index(edge_start);
+        edge_start += usize::from(degree);
+        *get_mut(&mut degree_offsets, usize::from(degree)) += 1;
+    }
+    debug_assert_eq!(edge_start, edges.len());
+
+    let mut order_start = 0usize;
+    for offset in &mut degree_offsets {
+        let count = *offset;
+        *offset = order_start;
+        order_start += count;
+    }
+    for (right, &degree) in right_degrees.iter().enumerate() {
+        let slot = get_mut(&mut degree_offsets, usize::from(degree));
+        *get_mut(layout, right_size + *slot) = u32_index(right);
+        *slot += 1;
     }
 
-    for left in 0..left_size {
-        let start = copy(offsets, left);
-        let end = copy(offsets, left + 1);
-        sort_right_slice_by_key(slice_mut(compact_edges, start..end), &scratch.right_keys);
+    // 稳定计数排序给出全局右顶点顺序；散布后，各左邻接表自然有序。
+    for order in 0..right_size {
+        let right = copy(layout, right_size + order) as usize;
+        let start = copy(layout, right) as usize;
+        let end = start + usize::from(copy(right_degrees, right));
+        for edge in slice(edges, start..end) {
+            debug_assert_eq!(usize::from(edge.right), right);
+            let left = usize::from(edge.left);
+            let slot = get_mut(&mut scratch.next_offsets, left);
+            *get_mut(compact_edges, *slot) = edge.right;
+            *slot += 1;
+        }
     }
 
     (
@@ -133,6 +132,7 @@ fn build_sparse_conflict_graph_grid_csr<H: ChordAccess, V: ChordAccess>(
         }
     }
 
+    // 保持右顶点顺序和连续分组，供有序 CSR 构建直接定位各段。
     for (index, vertical) in vertical_edges.iter().enumerate() {
         let vertical = vertical.chord();
         debug_assert_eq!(vertical.x1, vertical.x2);
@@ -208,4 +208,62 @@ fn internal_mask(start: u8, end: u8) -> u64 {
         (1u64 << (end + 1)) - 1
     };
     start_mask & end_mask
+}
+
+#[cfg(test)]
+#[allow(clippy::indexing_slicing)] // 列表中的编号均由 0..63 构造。
+mod tests {
+    use super::*;
+    use crate::matching::MatchingScratch;
+
+    #[test]
+    fn linear_scatter_matches_comparison_sort_with_ties_and_empty_vertices() {
+        let mut storage = MatchingScratch::default();
+        assert!(storage.preallocate_64().is_ok());
+        let scratch = &mut storage.conflict.finalize;
+        let capacity = scratch.right_layout.capacity();
+        let mut columns = [
+            vec![],
+            (0..63).map(u16_index).collect(),
+            vec![0],
+            (0..63).step_by(2).map(u16_index).collect(),
+            (0..63).map(u16_index).collect(),
+            vec![0, 62],
+            vec![],
+        ];
+        for _ in 0..columns.len() {
+            let mut expected = vec![Vec::<u16>::new(); 64];
+            scratch.edge_count = 0;
+            scratch.right_degrees.clear();
+            for (right, neighbors) in columns.iter().enumerate() {
+                let mut degree = 0u8;
+                for &left in neighbors {
+                    scratch.edge_buffer[scratch.edge_count] = SparseEdge {
+                        left,
+                        right: u16_index(right),
+                    };
+                    scratch.edge_count += 1;
+                    expected[usize::from(left)].push(u16_index(right));
+                    degree += 1;
+                }
+                scratch.right_degrees.push(degree);
+            }
+            for row in &mut expected {
+                row.sort_unstable_by_key(|&right| {
+                    (scratch.right_degrees[usize::from(right)], right)
+                });
+            }
+            let (actual, _) = build_sparse_adjacency_in_scratch(64, columns.len(), scratch);
+            for (left, row) in expected.iter().enumerate() {
+                assert_eq!(actual.neighbors(left), row);
+            }
+            columns.rotate_left(1);
+        }
+        assert_eq!(scratch.right_layout.capacity(), capacity);
+        scratch.edge_count = 0;
+        scratch.right_degrees.clear();
+        let (empty, _) = build_sparse_adjacency_in_scratch(0, 0, scratch);
+        assert_eq!(empty.offsets, &[0]);
+        assert!(empty.edges.is_empty());
+    }
 }

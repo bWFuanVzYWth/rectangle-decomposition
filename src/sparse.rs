@@ -1710,6 +1710,7 @@ mod tests {
     use std::num::NonZeroU16;
 
     use super::*;
+    use crate::get_mut;
 
     const ROOT_LOD: u8 = 6;
     const GENERATED_TILE_LOD: u8 = 3;
@@ -1937,5 +1938,60 @@ mod tests {
             return;
         };
         assert!(!rects.is_empty());
+    }
+
+    #[test]
+    fn two_colored_regions_with_holes_keep_optimum_and_exact_coverage() {
+        // 单个图案的冲突图为 C8；独立穷举像素矩形分区的最优值为 6。
+        let pattern = [
+            b"........",
+            b"........",
+            b"........",
+            b"....#...",
+            b"...####.",
+            b".###.###",
+            b".#######",
+            b"...####.",
+        ];
+        let mut expected = [[0u16; EDGE]; EDGE];
+        let mut leaves = Vec::new();
+        for (origin, value) in [(0u8, 1u16), (16u8, u16::MAX)] {
+            for (v, row) in (0u8..8).zip(pattern) {
+                for (u, &pixel) in (0u8..8).zip(row) {
+                    if pixel == b'#' {
+                        *get_mut(
+                            get_mut(&mut expected, usize::from(v)),
+                            usize::from(origin + u),
+                        ) = value;
+                        leaves.push(leaf(origin + u, v, 0, nz(value)));
+                    }
+                }
+            }
+        }
+        let Some(mut scratch) = ok(SparseOptimalScratch64::try_new_preallocated()) else {
+            return;
+        };
+        let Some(rectangles) = ok(scratch.decompose_borrowed(&leaves)) else {
+            return;
+        };
+        assert_eq!(rectangles.len(), 12);
+        let mut actual = [[0u16; EDGE]; EDGE];
+        for rectangle in rectangles {
+            for y in rectangle.y.start..rectangle.y.end {
+                for x in rectangle.x.start..rectangle.x.end {
+                    let pixel = get_mut(get_mut(&mut actual, usize::from(y)), usize::from(x));
+                    assert_eq!(*pixel, 0, "矩形不得重叠");
+                    *pixel = rectangle.value;
+                }
+            }
+        }
+        assert_eq!(actual, expected);
+        #[cfg(feature = "profile")]
+        {
+            let Some(profile) = ok(scratch.decompose_profile(&leaves)) else {
+                return;
+            };
+            assert_eq!(profile.counts.rectangles, 12);
+        }
     }
 }

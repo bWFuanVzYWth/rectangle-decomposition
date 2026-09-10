@@ -1,7 +1,7 @@
 //! 稀疏 chord 匹配后端。
 //!
 //! 对每个颜色组的水平/垂直 chord 构建二分冲突图 CSR，再用
-//! Hopcroft-Karp 求最大独立集。
+//! Hopcroft-Karp 的 Duff-Wiberg 变体（HKDW）求最大独立集。
 
 #[cfg(feature = "profile")]
 use std::time::{Duration, Instant};
@@ -64,7 +64,8 @@ pub struct SparseAdjacencyRef<'a> {
 
 #[derive(Clone, Debug)]
 pub struct ConflictFinalizeScratch {
-    pub(super) right_keys: Vec<u32>,
+    /// 前半段为右顶点的边段起点，后半段为按 (度数, 编号) 排序的右顶点。
+    pub(super) right_layout: Vec<u32>,
     pub(super) next_offsets: Vec<usize>,
     pub(super) edge_buffer: [SparseEdge; IMAGE64_MAX_CONFLICT_EDGES],
     pub(super) edge_count: usize,
@@ -81,7 +82,7 @@ pub struct ConflictFinalizeScratch {
 impl Default for ConflictFinalizeScratch {
     fn default() -> Self {
         Self {
-            right_keys: Vec::new(),
+            right_layout: Vec::new(),
             next_offsets: Vec::new(),
             edge_buffer: [SparseEdge { left: 0, right: 0 }; IMAGE64_MAX_CONFLICT_EDGES],
             edge_count: 0,
@@ -102,16 +103,17 @@ pub struct ConflictScratch {
     pub(super) finalize: ConflictFinalizeScratch,
 }
 
-/// HK 算法阶段的复用 scratch。
+/// HKDW 算法阶段的复用 scratch。
 #[derive(Clone, Debug, Default)]
 pub struct HkScratch {
     pub(super) pair_left: Vec<u16>,
     pub(super) pair_right: Vec<u16>,
-    pub(super) distance: Vec<u16>,
+    pub(super) right_distance: Vec<u16>,
     pub(super) queue: Vec<u16>,
-    pub(super) next_edge: Vec<usize>,
     pub(super) unmatched_lefts: Vec<u16>,
-    pub(super) touched_lefts: Vec<u16>,
+    /// 最短层上的空闲左顶点，可重复；长度至多为冲突边数。
+    pub(super) shortest_roots: Vec<u16>,
+    /// 搜索时复用为本轮访问标记，结束后保存独立集所需的可达性。
     pub(super) reachable_left: Vec<bool>,
     pub(super) reachable_right: Vec<bool>,
     pub(super) transpose_offsets: Vec<usize>,
@@ -119,7 +121,6 @@ pub struct HkScratch {
     pub(super) write_offsets: Vec<usize>,
     pub(super) right_order: Vec<u16>,
     pub(super) right_degree_counts: Vec<usize>,
-    pub(super) left_degree_counts: Vec<usize>,
     pub(super) dfs_stack: Vec<(usize, usize)>,
 }
 
@@ -148,7 +149,7 @@ impl MatchingScratch {
     /// 资源契约：成功后 matching hot path 不需要扩容，除非未来上界被改大。
     pub(crate) fn preallocate_64(&mut self) -> Result<(), crate::SparseQuadError> {
         let max_chords = IMAGE64_AXIS_LIMIT * (IMAGE64_AXIS_LIMIT - 1);
-        reserve_vec(&mut self.conflict.finalize.right_keys, max_chords)?;
+        reserve_vec(&mut self.conflict.finalize.right_layout, 2 * max_chords)?;
         reserve_vec(&mut self.conflict.finalize.next_offsets, max_chords)?;
         reserve_vec(&mut self.conflict.finalize.right_degrees, max_chords)?;
         reserve_vec(
@@ -162,11 +163,10 @@ impl MatchingScratch {
 
         reserve_vec(&mut self.hk.pair_left, max_chords)?;
         reserve_vec(&mut self.hk.pair_right, max_chords)?;
-        reserve_vec(&mut self.hk.distance, max_chords)?;
+        reserve_vec(&mut self.hk.right_distance, max_chords)?;
         reserve_vec(&mut self.hk.queue, max_chords)?;
-        reserve_vec(&mut self.hk.next_edge, max_chords)?;
         reserve_vec(&mut self.hk.unmatched_lefts, max_chords)?;
-        reserve_vec(&mut self.hk.touched_lefts, max_chords)?;
+        reserve_vec(&mut self.hk.shortest_roots, IMAGE64_MAX_CONFLICT_EDGES)?;
         reserve_vec(&mut self.hk.reachable_left, max_chords)?;
         reserve_vec(&mut self.hk.reachable_right, max_chords)?;
         reserve_vec(&mut self.hk.transpose_offsets, max_chords + 1)?;
@@ -174,7 +174,6 @@ impl MatchingScratch {
         reserve_vec(&mut self.hk.write_offsets, max_chords)?;
         reserve_vec(&mut self.hk.right_order, max_chords)?;
         reserve_vec(&mut self.hk.right_degree_counts, IMAGE64_AXIS_LIMIT)?;
-        reserve_vec(&mut self.hk.left_degree_counts, IMAGE64_AXIS_LIMIT)?;
         reserve_vec(&mut self.hk.dfs_stack, max_chords)?;
         reserve_vec(&mut self.selected_horizontal, max_chords)?;
         reserve_vec(&mut self.selected_vertical, max_chords)?;
@@ -213,7 +212,7 @@ impl MatchingScratch {
             vertical_edges,
             &mut self.conflict,
         );
-        crate::hk::hopcroft_karp_sparse_csr_u16(
+        crate::hk::hopcroft_karp_dw_sparse_csr_u16(
             &sparse_adjacency,
             vertical_edges.len(),
             right_degrees,
@@ -254,7 +253,7 @@ impl MatchingScratch {
             vertical_edges,
             &mut self.conflict,
         );
-        let (mut timings, counts) = crate::hk::hopcroft_karp_sparse_csr_u16_profile(
+        let (mut timings, counts) = crate::hk::hopcroft_karp_dw_sparse_csr_u16_profile(
             &sparse_adjacency,
             vertical_edges.len(),
             right_degrees,
