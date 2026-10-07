@@ -143,7 +143,10 @@ fn build_reverse_levels(scratch: &mut HkScratch) -> Option<u16> {
         }
         let start = copy(&scratch.transpose_offsets, right);
         let end = copy(&scratch.transpose_offsets, right + 1);
-        for &left in slice(&scratch.transpose_edges, start..end) {
+        for &left in slice(
+            &scratch.transpose_edges,
+            usize::from(start)..usize::from(end),
+        ) {
             let matched = copy(&scratch.pair_left, usize::from(left));
             if matched == UNMATCHED_U16 {
                 shortest_depth = depth;
@@ -203,13 +206,14 @@ fn dfs(
     scratch.dfs_stack.clear();
     scratch
         .dfs_stack
-        .push((start_left, copy(adjacency.offsets, start_left)));
+        .push((u16_index(start_left), copy(adjacency.offsets, start_left)));
     *get_mut(&mut scratch.reachable_left, start_left) = true;
     while let Some(&(left, mut edge)) = scratch.dfs_stack.last() {
+        let left = usize::from(left);
         let mut descended = false;
         let end = copy(adjacency.offsets, left + 1);
         while edge < end {
-            let right = usize::from(copy(adjacency.edges, edge));
+            let right = usize::from(copy(adjacency.edges, usize::from(edge)));
             edge += 1;
             if shortest_depth.is_some_and(|depth| {
                 usize::from(copy(&scratch.right_distance, right)) + scratch.dfs_stack.len()
@@ -223,10 +227,9 @@ fn dfs(
                 *get_mut(&mut scratch.pair_right, right) = u16_index(left);
                 for index in (0..scratch.dfs_stack.len() - 1).rev() {
                     let (previous_left, previous_edge) = copy(&scratch.dfs_stack, index);
-                    let previous_right = copy(adjacency.edges, previous_edge - 1);
-                    *get_mut(&mut scratch.pair_left, previous_left) = previous_right;
-                    *get_mut(&mut scratch.pair_right, usize::from(previous_right)) =
-                        u16_index(previous_left);
+                    let previous_right = copy(adjacency.edges, usize::from(previous_edge - 1));
+                    *get_mut(&mut scratch.pair_left, usize::from(previous_left)) = previous_right;
+                    *get_mut(&mut scratch.pair_right, usize::from(previous_right)) = previous_left;
                 }
                 return true;
             }
@@ -237,7 +240,7 @@ fn dfs(
                 *get_mut(&mut scratch.reachable_left, next_left) = true;
                 scratch
                     .dfs_stack
-                    .push((next_left, copy(adjacency.offsets, next_left)));
+                    .push((matched, copy(adjacency.offsets, next_left)));
                 descended = true;
                 break;
             }
@@ -283,7 +286,7 @@ mod tests {
     use crate::matching::MatchingScratch;
 
     struct Graph {
-        offsets: Vec<usize>,
+        offsets: Vec<u16>,
         edges: Vec<u16>,
         degrees: Vec<u8>,
     }
@@ -298,7 +301,7 @@ mod tests {
                     edges.push(right);
                     degrees[usize::from(right)] += 1;
                 }
-                offsets.push(edges.len());
+                offsets.push(u16_index(edges.len()));
             }
             Self {
                 offsets,

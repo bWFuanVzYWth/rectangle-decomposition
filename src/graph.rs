@@ -78,7 +78,7 @@ pub fn build_sparse_adjacency_in_scratch(
             debug_assert_eq!(usize::from(edge.right), right);
             let left = usize::from(edge.left);
             let slot = get_mut(&mut scratch.next_offsets, left);
-            *get_mut(compact_edges, *slot) = edge.right;
+            *get_mut(compact_edges, usize::from(*slot)) = edge.right;
             *slot += 1;
         }
     }

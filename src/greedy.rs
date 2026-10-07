@@ -10,7 +10,7 @@ pub fn greedy_augment_len3_sparse_csr_u16(
     adjacency: &SparseAdjacencyRef<'_>,
     pair_left: &mut [u16],
     pair_right: &mut [u16],
-    next_edges: &mut ChordBuffer<usize>,
+    next_edges: &mut ChordBuffer<u16>,
 ) {
     next_edges.clear();
     next_edges.extend_from_slice(slice(adjacency.offsets, 0..pair_left.len()));
@@ -34,7 +34,7 @@ pub fn greedy_augment_len3_sparse_csr_u16(
             // 长度 1/3 的增广只会减少空闲右顶点，已检查的邻居不会再次可用。
             // 成功选中的右顶点也立即占用，所以每条内层边至多检查一次。
             while *next_edge < end {
-                let alternate_right = copy(adjacency.edges, *next_edge);
+                let alternate_right = copy(adjacency.edges, usize::from(*next_edge));
                 *next_edge += 1;
                 let alternate_right = usize::from(alternate_right);
                 if copy(pair_right, alternate_right) != UNMATCHED_U16 {
@@ -64,7 +64,7 @@ pub fn greedy_initialize_sparse_matching_csr_u16(
             continue;
         }
 
-        let right = usize::from(copy(adjacency.edges, start));
+        let right = usize::from(copy(adjacency.edges, usize::from(start)));
         if copy(pair_right, right) == UNMATCHED_U16 {
             *get_mut(pair_left, left) = u16_index(right);
             *get_mut(pair_right, right) = u16_index(left);
@@ -74,7 +74,7 @@ pub fn greedy_initialize_sparse_matching_csr_u16(
     scratch.transpose_offsets.clear();
     scratch.transpose_offsets.resize(right_degrees.len() + 1, 0);
     for (right, &degree) in right_degrees.iter().enumerate() {
-        let offset = copy(&scratch.transpose_offsets, right) + usize::from(degree);
+        let offset = copy(&scratch.transpose_offsets, right) + u16::from(degree);
         *get_mut(&mut scratch.transpose_offsets, right + 1) = offset;
     }
     scratch.transpose_edges.clear();
@@ -88,7 +88,7 @@ pub fn greedy_initialize_sparse_matching_csr_u16(
         for &right in adjacency.neighbors(left) {
             let right = usize::from(right);
             let slot = copy(&scratch.write_offsets, right);
-            *get_mut(&mut scratch.transpose_edges, slot) = u16_index(left);
+            *get_mut(&mut scratch.transpose_edges, usize::from(slot)) = u16_index(left);
             *get_mut(&mut scratch.write_offsets, right) += 1;
         }
     }
@@ -106,7 +106,10 @@ pub fn greedy_initialize_sparse_matching_csr_u16(
         }
         let start = copy(&scratch.transpose_offsets, right);
         let end = copy(&scratch.transpose_offsets, right + 1);
-        for &left in slice(&scratch.transpose_edges, start..end) {
+        for &left in slice(
+            &scratch.transpose_edges,
+            usize::from(start)..usize::from(end),
+        ) {
             let left = usize::from(left);
             if copy(pair_left, left) == UNMATCHED_U16 {
                 *get_mut(pair_left, left) = u16_index(right);
@@ -196,7 +199,7 @@ mod tests {
                         edges.push(u16_index(right));
                     }
                 }
-                offsets.push(edges.len());
+                offsets.push(u16_index(edges.len()));
             }
             let adjacency = SparseAdjacencyRef {
                 offsets: &offsets,

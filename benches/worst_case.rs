@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use criterion::{BenchmarkId, Criterion, criterion_group, criterion_main};
 use rectangle_decomposition::{
-    QuadLeaf64, SparseLayerBuilder64, SparseOptimalScratch64, SparseQuadImage64,
+    DenseLabels64, QuadLeaf64, Rectangle, SparseLayerBuilder64, SparseOptimalScratch64,
+    SparseQuadImage64,
 };
 
 const EDGE: u8 = 64;
@@ -82,9 +83,8 @@ fn bench_low_discrepancy_holes_7_8(c: &mut Criterion) {
 
     c.bench_function("low_discrepancy_holes_7_8_64", |b| {
         b.iter(|| {
-            let rect_count =
-                require_ok(scratch.decompose_borrowed(black_box(leaves.as_slice()))).len();
-            black_box(rect_count);
+            let rectangles = require_ok(scratch.decompose_borrowed(black_box(leaves.as_slice())));
+            black_box((rectangles.len(), consume_rectangles(rectangles)));
         });
     });
 }
@@ -108,6 +108,89 @@ fn require_ok<T, E: std::fmt::Debug>(result: Result<T, E>) -> T {
             std::process::exit(1);
         }
     }
+}
+
+fn rectangle_checksum(rectangle: Rectangle) -> u64 {
+    let bounds = u32::from_le_bytes([
+        rectangle.x.start,
+        rectangle.x.end,
+        rectangle.y.start,
+        rectangle.y.end,
+    ]);
+    u64::from(bounds) | (u64::from(rectangle.value) << 32)
+}
+
+fn consume_rectangles(rectangles: &[Rectangle]) -> u64 {
+    rectangles.iter().copied().fold(0, |sum, rectangle| {
+        sum.wrapping_add(rectangle_checksum(rectangle))
+    })
+}
+
+// 准备成本在计时外：真实上游可直接写这个连续标签布局。
+fn dense_labels(leaves: &[QuadLeaf64]) -> DenseLabels64 {
+    let mut labels = DenseLabels64::new();
+    for leaf in leaves {
+        let side = 1usize << leaf.lod;
+        for row in labels
+            .rows_mut()
+            .iter_mut()
+            .skip(usize::from(leaf.v))
+            .take(side)
+        {
+            for pixel in row.iter_mut().skip(usize::from(leaf.u)).take(side) {
+                assert_eq!(*pixel, 0, "benchmark leaves overlap");
+                *pixel = leaf.value.get();
+            }
+        }
+    }
+    labels
+}
+
+fn validate_output_paths(
+    name: &str,
+    leaves: &[QuadLeaf64],
+    image: &SparseQuadImage64,
+    labels: &DenseLabels64,
+    expected_count: Option<usize>,
+    scratch: &mut SparseOptimalScratch64,
+) -> usize {
+    let expected = require_ok(scratch.decompose_borrowed(leaves)).to_vec();
+    assert_eq!(
+        require_ok(scratch.decompose_quads_borrowed(image)),
+        &expected,
+        "prepared image disagrees for {name}"
+    );
+    assert_eq!(
+        require_ok(scratch.decompose_labels_borrowed(labels)),
+        &expected,
+        "native labels disagree for {name}"
+    );
+    let mut sink_index = 0;
+    assert_eq!(
+        require_ok(scratch.decompose_into(leaves, |rectangle| {
+            assert_eq!(expected.get(sink_index), Some(&rectangle));
+            sink_index += 1;
+            Ok(())
+        })),
+        expected.len()
+    );
+    sink_index = 0;
+    assert_eq!(
+        require_ok(scratch.decompose_labels_into(labels, |rectangle| {
+            assert_eq!(expected.get(sink_index), Some(&rectangle));
+            sink_index += 1;
+            Ok(())
+        })),
+        expected.len()
+    );
+    if let Some(count) = expected_count {
+        assert_eq!(
+            expected.len(),
+            count,
+            "unexpected rectangle count for {name}"
+        );
+    }
+    expected.len()
 }
 
 fn unit_leaves(mut pixel_value: impl FnMut(u8, u8) -> Option<NonZeroU16>) -> Vec<QuadLeaf64> {
@@ -278,31 +361,62 @@ fn bench_representative_inputs(c: &mut Criterion) {
 
     for (name, leaves, expected_rectangles) in representative_inputs() {
         let image = require_ok(SparseQuadImage64::from_leaves(&leaves));
+        let labels = dense_labels(&leaves);
         let mut scratch = SparseOptimalScratch64::new();
         let mut builder = SparseLayerBuilder64::new();
-        // Validate both paths and known simple optima before starting either timer.
-        let leaf_count = require_ok(scratch.decompose_borrowed(&leaves)).len();
-        let image_count = require_ok(scratch.decompose_quads_borrowed(&image)).len();
-        assert_eq!(leaf_count, image_count, "entry points disagree for {name}");
+        // 输出顺序与简单已知最优值在全部计时之前检查。
+        let leaf_count = validate_output_paths(
+            name,
+            &leaves,
+            &image,
+            &labels,
+            expected_rectangles,
+            &mut scratch,
+        );
         for &leaf in &leaves {
             require_ok(builder.push_square(leaf.u, leaf.v, leaf.lod, leaf.value));
         }
         assert_eq!(require_ok(builder.finish(&mut scratch)).len(), leaf_count);
-        if let Some(expected) = expected_rectangles {
-            assert_eq!(
-                leaf_count, expected,
-                "unexpected rectangle count for {name}"
-            );
-        }
 
         group.bench_function(BenchmarkId::new("borrowed_leaves", name), |b| {
             b.iter(|| {
-                black_box(require_ok(scratch.decompose_borrowed(black_box(&leaves))).len());
+                let rectangles = require_ok(scratch.decompose_borrowed(black_box(&leaves)));
+                black_box((rectangles.len(), consume_rectangles(rectangles)));
             });
         });
         group.bench_function(BenchmarkId::new("prepared_image", name), |b| {
             b.iter(|| {
-                black_box(require_ok(scratch.decompose_quads_borrowed(black_box(&image))).len());
+                let rectangles = require_ok(scratch.decompose_quads_borrowed(black_box(&image)));
+                black_box((rectangles.len(), consume_rectangles(rectangles)));
+            });
+        });
+        group.bench_function(BenchmarkId::new("native_labels", name), |b| {
+            b.iter(|| {
+                let rectangles = require_ok(scratch.decompose_labels_borrowed(black_box(&labels)));
+                black_box((rectangles.len(), consume_rectangles(rectangles)));
+            });
+        });
+        group.bench_function(BenchmarkId::new("direct_sink", name), |b| {
+            b.iter(|| {
+                let mut checksum = 0u64;
+                let count = require_ok(scratch.decompose_into(black_box(&leaves), |rectangle| {
+                    checksum = checksum.wrapping_add(rectangle_checksum(rectangle));
+                    Ok(())
+                }));
+                black_box((count, checksum));
+            });
+        });
+        group.bench_function(BenchmarkId::new("native_labels_sink", name), |b| {
+            b.iter(|| {
+                let mut checksum = 0u64;
+                let count = require_ok(scratch.decompose_labels_into(
+                    black_box(&labels),
+                    |rectangle| {
+                        checksum = checksum.wrapping_add(rectangle_checksum(rectangle));
+                        Ok(())
+                    },
+                ));
+                black_box((count, checksum));
             });
         });
         group.bench_function(BenchmarkId::new("prepare_image", name), |b| {
@@ -315,9 +429,9 @@ fn bench_representative_inputs(c: &mut Criterion) {
         group.bench_function(BenchmarkId::new("construct_and_decompose", name), |b| {
             b.iter(|| {
                 let fresh_image = require_ok(SparseQuadImage64::from_leaves(black_box(&leaves)));
-                black_box(
-                    require_ok(scratch.decompose_quads_borrowed(black_box(&fresh_image))).len(),
-                );
+                let rectangles =
+                    require_ok(scratch.decompose_quads_borrowed(black_box(&fresh_image)));
+                black_box((rectangles.len(), consume_rectangles(rectangles)));
             });
         });
         group.bench_function(BenchmarkId::new("builder_layer", name), |b| {
@@ -327,10 +441,142 @@ fn bench_representative_inputs(c: &mut Criterion) {
                     require_ok(builder.push_square(leaf.u, leaf.v, leaf.lod, leaf.value));
                 }
                 let rectangles = require_ok(builder.finish(&mut scratch));
-                black_box(rectangles.len());
+                black_box((rectangles.len(), consume_rectangles(&rectangles)));
             });
         });
     }
+    group.finish();
+}
+
+fn for_chunk_planes<T>(interior: &[T; 2], boundary: &[T; 2], mut visit: impl FnMut(&T)) {
+    let [first, last] = boundary;
+    for _ in 0..3 {
+        visit(first);
+        for plane in interior.iter().cycle().take(63) {
+            visit(plane);
+        }
+        visit(last);
+    }
+}
+
+// 真实 64³ rock/air 棋盘格：每轴 63 个内层面与两个外边界面。
+// 内层正负法线对应不同 label；两侧边界覆盖的棋盘相位相反。
+fn voxel_checker_planes() -> ([Vec<QuadLeaf64>; 2], [Vec<QuadLeaf64>; 2]) {
+    let second = require_ok(NonZeroU16::try_from(2));
+    let interior = [false, true].map(|reverse| {
+        unit_leaves(|u, v| {
+            Some(if ((u + v) % 2 == 0) == reverse {
+                second
+            } else {
+                NonZeroU16::MIN
+            })
+        })
+    });
+    let boundary = [false, true].map(|reverse| {
+        unit_leaves(|u, v| (((u + v) % 2 == 0) != reverse).then_some(NonZeroU16::MIN))
+    });
+    (interior, boundary)
+}
+
+fn bench_voxel_checker_chunk(c: &mut Criterion) {
+    let (interior, boundary) = voxel_checker_planes();
+    let interior_labels = interior.each_ref().map(|leaves| dense_labels(leaves));
+    let boundary_labels = boundary.each_ref().map(|leaves| dense_labels(leaves));
+    let mut chunk_leaves = Vec::with_capacity(195);
+    let mut chunk_labels = Vec::with_capacity(195);
+    for_chunk_planes(&interior, &boundary, |leaves| {
+        chunk_leaves.push(leaves.clone());
+    });
+    for_chunk_planes(&interior_labels, &boundary_labels, |labels| {
+        chunk_labels.push(labels.clone());
+    });
+    let mut scratch = SparseOptimalScratch64::new();
+    for (leaves, labels, count) in interior
+        .iter()
+        .zip(&interior_labels)
+        .map(|(leaves, labels)| (leaves, labels, PIXELS))
+        .chain(
+            boundary
+                .iter()
+                .zip(&boundary_labels)
+                .map(|(leaves, labels)| (leaves, labels, PIXELS / 2)),
+        )
+    {
+        let image = require_ok(SparseQuadImage64::from_leaves(leaves));
+        validate_output_paths(
+            "voxel_checker_plane",
+            leaves,
+            &image,
+            labels,
+            Some(count),
+            &mut scratch,
+        );
+    }
+    let mut total = 0usize;
+    for leaves in &chunk_leaves {
+        total += require_ok(scratch.decompose_borrowed(leaves)).len();
+    }
+    assert_eq!(total, 786_432);
+
+    // 195 份独立输入均在计时外准备，计时覆盖输入工作集与矩形 checksum 消费。
+    // 这是分解吞吐，未包含可见面抽取、顶点去重、mesh 打包或 GPU 上传。
+    let mut group = c.benchmark_group("voxel_checker_chunk_195_planes");
+    group.sample_size(10);
+    group.warm_up_time(Duration::from_millis(100));
+    group.measurement_time(Duration::from_secs(2));
+    group.bench_function("borrowed_leaves", |b| {
+        b.iter(|| {
+            let mut count = 0usize;
+            let mut checksum = 0u64;
+            for leaves in &chunk_leaves {
+                let rectangles = require_ok(scratch.decompose_borrowed(black_box(leaves)));
+                count += rectangles.len();
+                checksum = checksum.wrapping_add(consume_rectangles(rectangles));
+            }
+            black_box((count, checksum));
+        });
+    });
+    group.bench_function("native_labels", |b| {
+        b.iter(|| {
+            let mut count = 0usize;
+            let mut checksum = 0u64;
+            for labels in &chunk_labels {
+                let rectangles = require_ok(scratch.decompose_labels_borrowed(black_box(labels)));
+                count += rectangles.len();
+                checksum = checksum.wrapping_add(consume_rectangles(rectangles));
+            }
+            black_box((count, checksum));
+        });
+    });
+    group.bench_function("direct_sink", |b| {
+        b.iter(|| {
+            let mut count = 0usize;
+            let mut checksum = 0u64;
+            for leaves in &chunk_leaves {
+                count += require_ok(scratch.decompose_into(black_box(leaves), |rectangle| {
+                    checksum = checksum.wrapping_add(rectangle_checksum(rectangle));
+                    Ok(())
+                }));
+            }
+            black_box((count, checksum));
+        });
+    });
+    group.bench_function("native_labels_sink", |b| {
+        b.iter(|| {
+            let mut count = 0usize;
+            let mut checksum = 0u64;
+            for labels in &chunk_labels {
+                count += require_ok(scratch.decompose_labels_into(
+                    black_box(labels),
+                    |rectangle| {
+                        checksum = checksum.wrapping_add(rectangle_checksum(rectangle));
+                        Ok(())
+                    },
+                ));
+            }
+            black_box((count, checksum));
+        });
+    });
     group.finish();
 }
 
@@ -349,5 +595,6 @@ criterion_group!(
     bench_prepare_image,
     bench_scratch_init,
     bench_representative_inputs,
+    bench_voxel_checker_chunk,
 );
 criterion_main!(benches);

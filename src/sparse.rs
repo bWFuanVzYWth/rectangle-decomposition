@@ -1,7 +1,7 @@
 //! 固定 64x64 sparse quad 输入的矩形分解。
 //!
-//! 输入为非零 dyadic square 列表，内部派生区间、chord 与 cut，
-//! 不创建 dense 像素图。
+//! 输入为非零 dyadic square 列表或连续标签切面，内部派生区间、chord 与 cut。
+//! 少量叶子使用区间事件；大量叶子使用 SIMD 栅格扫描。
 
 use std::num::NonZeroU16;
 use std::simd::u16x32;
@@ -10,8 +10,14 @@ use std::time::{Duration, Instant};
 
 use crate::fixed::FixedVec;
 use crate::matching::{ChordBuffer, MatchingScratch};
-use crate::types::{ActiveRect, ChordAccess, EffectiveChord, Orientation, RangeU8, Rectangle, Run};
+use crate::types::{
+    ActiveRect, ChordAccess, EffectiveChord, Orientation, PackedRectangles64, RangeU8, Rectangle,
+    Run,
+};
 use crate::{get, slice, slice_mut};
+
+mod dense;
+pub use dense::DenseLabels64;
 
 const EDGE: usize = 64;
 const EDGE_U8: u8 = 64;
@@ -209,15 +215,14 @@ pub struct SparseOptimalScratch64 {
     column_buckets: [IntervalBucket; EDGE],
     rows: AxisIntervals,
     columns: AxisIntervals,
+    dense_labels: DenseLabels64,
     chord_groups: SparseChords,
     matching: MatchingScratch,
     horizontal_cuts: ChordBuffer<HorizontalCut>,
     vertical_cuts: ChordBuffer<VerticalCut>,
     horizontal_cut_masks: FixedVec<u64, EDGE>,
     vertical_cut_masks: FixedVec<u128, EDGE>,
-    runs: FixedVec<Run, EDGE>,
-    active_rects: FixedVec<ActiveRect, EDGE>,
-    next_active_rects: FixedVec<ActiveRect, EDGE>,
+    partition: PartitionScratch,
     rectangles: FixedVec<Rectangle, MAX_RECTANGLES>,
 }
 
@@ -239,6 +244,7 @@ impl SparseOptimalScratch64 {
                 column_buckets: [const { IntervalBucket::new() }; EDGE],
                 rows: AxisIntervals::new(),
                 columns: AxisIntervals::new(),
+                dense_labels: DenseLabels64::new(),
                 chord_groups: SparseChords::new(),
                 matching: MatchingScratch::new(),
                 horizontal_cuts: FixedVec::new(HorizontalCut {
@@ -253,13 +259,7 @@ impl SparseOptimalScratch64 {
                 }),
                 horizontal_cut_masks: FixedVec::new(0),
                 vertical_cut_masks: FixedVec::new(0),
-                runs: FixedVec::new(Run {
-                    value: 0,
-                    x_start: 0,
-                    x_end: 0,
-                }),
-                active_rects: FixedVec::new(ActiveRect::new(0, 0, 0, 0)),
-                next_active_rects: FixedVec::new(ActiveRect::new(0, 0, 0, 0)),
+                partition: PartitionScratch::new(),
                 rectangles: FixedVec::new(Rectangle {
                     value: 0,
                     x: RangeU8::new(0, 0),
@@ -312,12 +312,61 @@ impl SparseOptimalScratch64 {
     ) -> Result<&[Rectangle], SparseQuadError> {
         build_axis_intervals_from_leaves(
             leaves.iter().copied(),
+            leaves.len(),
+            &mut self.dense_labels,
             &mut self.rows,
             &mut self.columns,
             &mut self.row_buckets,
             &mut self.column_buckets,
         )?;
         self.decompose_intervals_borrowed()
+    }
+
+    /// 对 sparse leaves 分解，每个完成的矩形直接交给调用方。
+    ///
+    /// 输出顺序与 `decompose_borrowed` 相同；不写入 scratch 的矩形数组。
+    /// 库不分配堆内存，sink 的资源行为由调用方决定。
+    ///
+    /// # Errors
+    ///
+    /// 输入错误在调用 sink 前返回。sink 错误会立即终止分区并原样返回；
+    /// 已交给 sink 的前缀及失败调用产生的副作用不回滚。后续调用可继续复用 scratch。
+    pub fn decompose_into<F>(
+        &mut self,
+        leaves: &[QuadLeaf64],
+        sink: F,
+    ) -> Result<usize, SparseQuadError>
+    where
+        F: FnMut(Rectangle) -> Result<(), SparseQuadError>,
+    {
+        build_axis_intervals_from_leaves(
+            leaves.iter().copied(),
+            leaves.len(),
+            &mut self.dense_labels,
+            &mut self.rows,
+            &mut self.columns,
+            &mut self.row_buckets,
+            &mut self.column_buckets,
+        )?;
+        extract_sparse_chords(&self.rows, &self.columns, &mut self.chord_groups)?;
+        self.select_cuts()?;
+        self.sparse_partition_into(sink)
+    }
+
+    /// 将矩形直接写入调用方的 bounds / labels `SoA` 输出。
+    ///
+    /// 调用开始时清空输出；整个调用不分配堆内存，也不经过 `AoS` 中间结果。
+    ///
+    /// # Errors
+    ///
+    /// 输入非法或容量超限时返回错误。失败时保留本次已写入的输出前缀。
+    pub fn decompose_packed(
+        &mut self,
+        leaves: &[QuadLeaf64],
+        output: &mut PackedRectangles64,
+    ) -> Result<usize, SparseQuadError> {
+        output.clear();
+        self.decompose_into(leaves, |rectangle| output.push(rectangle))
     }
 
     /// 对 `decompose` 同一路径计时。
@@ -336,6 +385,8 @@ impl SparseOptimalScratch64 {
         let axis_start = Instant::now();
         build_axis_intervals_from_leaves(
             leaves.iter().copied(),
+            leaves.len(),
+            &mut self.dense_labels,
             &mut self.rows,
             &mut self.columns,
             &mut self.row_buckets,
@@ -420,6 +471,8 @@ impl SparseOptimalScratch64 {
     ) -> Result<&[Rectangle], SparseQuadError> {
         build_axis_intervals_from_leaves(
             image.leaves.iter().map(|stored| stored.leaf),
+            image.leaves.len(),
+            &mut self.dense_labels,
             &mut self.rows,
             &mut self.columns,
             &mut self.row_buckets,
@@ -555,7 +608,6 @@ impl SparseOptimalScratch64 {
         Ok(timings)
     }
 
-    #[allow(clippy::mut_mut)] // Swap buffer references, not the inline array contents.
     fn sparse_partition(&mut self) -> Result<&[Rectangle], SparseQuadError> {
         let cut_boundaries = build_cut_masks(
             &self.horizontal_cuts,
@@ -564,65 +616,49 @@ impl SparseOptimalScratch64 {
             &mut self.vertical_cut_masks,
         )?;
 
-        let rows = &self.rows;
-        let horizontal_cut_masks = &self.horizontal_cut_masks;
-        let vertical_cut_masks = &self.vertical_cut_masks;
-        let runs = &mut self.runs;
-        let mut active = &mut self.active_rects;
-        let mut next_active = &mut self.next_active_rects;
-
         let result = &mut self.rectangles;
         result.clear();
-        reserve_exact(result, rows.intervals.len())?;
-        active.clear();
-        next_active.clear();
-
-        let Some(&first_vertical_cut_mask) = vertical_cut_masks.first() else {
-            return Err(SparseQuadError::CapacityOverflow);
-        };
-        build_runs_for_row(rows.line(0), first_vertical_cut_mask, runs)?;
-        reserve_exact(active, runs.len())?;
-        for &run in runs.as_slice() {
-            active.push(ActiveRect::new(run.value, run.x_start, run.x_end, 0));
-        }
-
-        let mut boundaries = (rows.boundaries | cut_boundaries) & !1u64;
-        while boundaries != 0 {
-            let y = u8::try_from(boundaries.trailing_zeros())
-                .map_err(|_| SparseQuadError::CapacityOverflow)?;
-            let y_index = usize::from(y);
-            let Some(&row_vertical_cut_mask) = vertical_cut_masks.get(y_index) else {
-                return Err(SparseQuadError::CapacityOverflow);
-            };
-            let Some(&horizontal_cut_mask) = horizontal_cut_masks.get(y_index) else {
-                return Err(SparseQuadError::CapacityOverflow);
-            };
-            build_runs_for_row(rows.line(y_index), row_vertical_cut_mask, runs)?;
-            merge_sparse_runs(
-                active.as_slice(),
-                runs.as_slice(),
-                y,
-                horizontal_cut_mask,
-                next_active,
-                result,
-            )?;
-            // 交换视图，避免逐行复制两个内联数组。
-            std::mem::swap(&mut active, &mut next_active);
-            boundaries &= boundaries - 1;
-        }
-
-        for &active_rect in active.as_slice() {
-            emit(active_rect, EDGE_U8, result)?;
-        }
-
+        reserve_exact(result, self.rows.intervals.len())?;
+        partition_rows(
+            &self.rows,
+            &self.horizontal_cut_masks,
+            &self.vertical_cut_masks,
+            cut_boundaries,
+            &mut self.partition,
+            |rectangle| {
+                reserve_one(result)?;
+                result.push(rectangle);
+                Ok(())
+            },
+        )?;
         Ok(result.as_slice())
+    }
+
+    fn sparse_partition_into<F>(&mut self, sink: F) -> Result<usize, SparseQuadError>
+    where
+        F: FnMut(Rectangle) -> Result<(), SparseQuadError>,
+    {
+        let cut_boundaries = build_cut_masks(
+            &self.horizontal_cuts,
+            &self.vertical_cuts,
+            &mut self.horizontal_cut_masks,
+            &mut self.vertical_cut_masks,
+        )?;
+        partition_rows(
+            &self.rows,
+            &self.horizontal_cut_masks,
+            &self.vertical_cut_masks,
+            cut_boundaries,
+            &mut self.partition,
+            sink,
+        )
     }
 }
 
 /// 固定 64x64 sparse layer 的增量构建器。
 ///
 /// 只接受非零 dyadic square。builder 内部保留未展开的 leaves，
-/// 不创建 dense image，也不要求调用方预合并相邻 square。
+/// finish 使用与借用分解相同的稀疏／栅格路径，无需预合并相邻 square。
 #[derive(Debug, Default)]
 pub struct SparseLayerBuilder64 {
     leaves: Vec<QuadLeaf64>,
@@ -853,13 +889,23 @@ impl AxisIntervals {
 
 // 从 leaves 构造轴区间
 
-fn build_axis_intervals_from_leaves(
-    leaves: impl IntoIterator<Item = QuadLeaf64>,
+fn build_axis_intervals_from_leaves<I>(
+    leaves: I,
+    leaf_count: usize,
+    dense_labels: &mut DenseLabels64,
     rows: &mut AxisIntervals,
     columns: &mut AxisIntervals,
     row_buckets: &mut [IntervalBucket; EDGE],
     column_buckets: &mut [IntervalBucket; EDGE],
-) -> Result<(), SparseQuadError> {
+) -> Result<(), SparseQuadError>
+where
+    I: IntoIterator<Item = QuadLeaf64>,
+    I::IntoIter: Clone,
+{
+    if leaf_count >= dense::DENSE_LEAF_THRESHOLD {
+        dense::rasterize_leaves(leaves, dense_labels, row_buckets)?;
+        return dense::build_axes(dense_labels, rows, columns, column_buckets);
+    }
     prepare_interval_buckets(row_buckets);
     prepare_interval_buckets(column_buckets);
     let mut all_lod_zero = true;
@@ -869,8 +915,8 @@ fn build_axis_intervals_from_leaves(
     }
 
     if all_lod_zero {
-        build_unit_axis_intervals_from_buckets(row_buckets, rows)?;
-        build_unit_axis_intervals_from_buckets(column_buckets, columns)
+        build_complete_axis_intervals_from_buckets(row_buckets, rows)?;
+        build_complete_axis_intervals_from_buckets(column_buckets, columns)
     } else {
         build_axis_intervals_from_buckets(row_buckets, rows, true)?;
         build_axis_intervals_from_buckets(column_buckets, columns, false)
@@ -917,7 +963,7 @@ fn push_leaf_axis_intervals_one(
 
 // 轴区间构建
 
-fn build_unit_axis_intervals_from_buckets(
+fn build_complete_axis_intervals_from_buckets(
     buckets: &[IntervalBucket; EDGE],
     output: &mut AxisIntervals,
 ) -> Result<(), SparseQuadError> {
@@ -1207,6 +1253,89 @@ struct VerticalCut {
 
 // 扫描线分区
 
+struct PartitionScratch {
+    runs: FixedVec<Run, EDGE>,
+    active: FixedVec<ActiveRect, EDGE>,
+    next_active: FixedVec<ActiveRect, EDGE>,
+}
+
+impl PartitionScratch {
+    const fn new() -> Self {
+        Self {
+            runs: FixedVec::new(Run {
+                value: 0,
+                x_start: 0,
+                x_end: 0,
+            }),
+            active: FixedVec::new(ActiveRect::new(0, 0, 0, 0)),
+            next_active: FixedVec::new(ActiveRect::new(0, 0, 0, 0)),
+        }
+    }
+}
+
+#[allow(clippy::mut_mut)] // 交换 buffer 引用，避免复制内联数组。
+fn partition_rows<F>(
+    rows: &AxisIntervals,
+    horizontal_cut_masks: &FixedVec<u64, EDGE>,
+    vertical_cut_masks: &FixedVec<u128, EDGE>,
+    cut_boundaries: u64,
+    scratch: &mut PartitionScratch,
+    mut sink: F,
+) -> Result<usize, SparseQuadError>
+where
+    F: FnMut(Rectangle) -> Result<(), SparseQuadError>,
+{
+    let runs = &mut scratch.runs;
+    let mut active = &mut scratch.active;
+    let mut next_active = &mut scratch.next_active;
+    active.clear();
+    next_active.clear();
+
+    let mut count = 0usize;
+    let mut counted_sink = |rectangle| {
+        sink(rectangle)?;
+        count += 1;
+        Ok(())
+    };
+    let Some(&first_vertical_cut_mask) = vertical_cut_masks.first() else {
+        return Err(SparseQuadError::CapacityOverflow);
+    };
+    build_runs_for_row(rows.line(0), first_vertical_cut_mask, runs)?;
+    reserve_exact(active, runs.len())?;
+    for &run in runs.as_slice() {
+        active.push(ActiveRect::new(run.value, run.x_start, run.x_end, 0));
+    }
+
+    let mut boundaries = (rows.boundaries | cut_boundaries) & !1u64;
+    while boundaries != 0 {
+        let y = u8::try_from(boundaries.trailing_zeros())
+            .map_err(|_| SparseQuadError::CapacityOverflow)?;
+        let y_index = usize::from(y);
+        let Some(&row_vertical_cut_mask) = vertical_cut_masks.get(y_index) else {
+            return Err(SparseQuadError::CapacityOverflow);
+        };
+        let Some(&horizontal_cut_mask) = horizontal_cut_masks.get(y_index) else {
+            return Err(SparseQuadError::CapacityOverflow);
+        };
+        build_runs_for_row(rows.line(y_index), row_vertical_cut_mask, runs)?;
+        merge_sparse_runs(
+            active.as_slice(),
+            runs.as_slice(),
+            y,
+            horizontal_cut_mask,
+            next_active,
+            &mut counted_sink,
+        )?;
+        // 交换视图，避免逐行复制两个内联数组。
+        std::mem::swap(&mut active, &mut next_active);
+        boundaries &= boundaries - 1;
+    }
+    for &active_rect in active.as_slice() {
+        emit(active_rect, EDGE_U8, &mut counted_sink)?;
+    }
+    Ok(count)
+}
+
 fn build_cut_masks(
     horizontal_cuts: &[HorizontalCut],
     vertical_cuts: &[VerticalCut],
@@ -1299,14 +1428,17 @@ fn push_run(
     Ok(())
 }
 
-fn merge_sparse_runs(
+fn merge_sparse_runs<F>(
     active: &[ActiveRect],
     runs: &[Run],
     y: u8,
     horizontal_cut_mask: u64,
     next_active: &mut FixedVec<ActiveRect, EDGE>,
-    result: &mut FixedVec<Rectangle, MAX_RECTANGLES>,
-) -> Result<(), SparseQuadError> {
+    result: &mut F,
+) -> Result<(), SparseQuadError>
+where
+    F: FnMut(Rectangle) -> Result<(), SparseQuadError>,
+{
     next_active.clear();
     let (mut active_index, mut run_index) = (0usize, 0usize);
 
@@ -1419,18 +1551,15 @@ const fn reserve_one<T: Copy, const N: usize>(
     Err(SparseQuadError::CapacityOverflow)
 }
 
-fn emit(
-    active: ActiveRect,
-    y_end: u8,
-    result: &mut FixedVec<Rectangle, MAX_RECTANGLES>,
-) -> Result<(), SparseQuadError> {
-    reserve_one(result)?;
-    result.push(Rectangle {
+fn emit<F>(active: ActiveRect, y_end: u8, result: &mut F) -> Result<(), SparseQuadError>
+where
+    F: FnMut(Rectangle) -> Result<(), SparseQuadError>,
+{
+    result(Rectangle {
         value: active.value,
         x: RangeU8::new(active.x_start, active.x_end),
         y: RangeU8::new(active.y_start, y_end),
-    });
-    Ok(())
+    })
 }
 
 // 测试
@@ -1448,6 +1577,33 @@ mod tests {
 
     fn nz(value: u16) -> NonZeroU16 {
         NonZeroU16::new(value).unwrap_or_else(|| std::process::abort())
+    }
+
+    #[test]
+    #[allow(clippy::panic_in_result_fn)] // Result 传播被测错误，断言检查直接输出资源契约。
+    fn direct_output_does_not_overwrite_borrowed_rectangle_storage() -> Result<(), SparseQuadError>
+    {
+        let mut scratch = SparseOptimalScratch64::new();
+        let first = [leaf(0, 0, 6, NonZeroU16::MIN)];
+        let expected = scratch.decompose(&first)?;
+        let second = [leaf(8, 16, 3, NonZeroU16::MAX)];
+        let mut seen = 0;
+        assert_eq!(
+            scratch.decompose_into(&second, |rectangle| {
+                assert_eq!(rectangle.value, u16::MAX);
+                seen += 1;
+                Ok(())
+            })?,
+            1
+        );
+        assert_eq!(seen, 1);
+        assert_eq!(scratch.rectangles.as_slice(), expected);
+        let mut packed = PackedRectangles64::new();
+        assert_eq!(scratch.decompose_packed(&second, &mut packed)?, 1);
+        assert_eq!(scratch.rectangles.as_slice(), expected);
+        assert_eq!(packed.bounds(), &[u32::from_le_bytes([8, 16, 16, 24])]);
+        assert_eq!(packed.labels(), &[u16::MAX]);
+        Ok(())
     }
 
     fn ok<T, E>(result: Result<T, E>) -> Option<T> {

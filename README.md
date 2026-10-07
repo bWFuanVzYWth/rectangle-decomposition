@@ -8,9 +8,9 @@
 
 ## 输入、输出和边界
 
-- 输入为 `QuadLeaf64` 列表：`(u, v)` 是左上角，边长为 `2^lod`，`lod` 在 `0..=6`；坐标必须按边长对齐，叶子不得越界或重叠。
-- `value: NonZeroU16` 是调用方定义的颜色／材质标签；未提供的像素是背景。普通像素直接用 `lod = 0`，不需要先构建四叉树。
-- 输出为带相同标签的 `Rectangle`，范围 `x.start..x.end`、`y.start..y.end` 左闭右开。矩形尺寸不受输入叶子的 LOD 限制。
+- 原生输入为 `DenseLabels64`：64 字节对齐的行主序 `[[u16; 64]; 64]`，标签 0 是背景，`1..=65535` 是调用方定义的颜色／材质键。上游可直接写入 `rows_mut()`，省去单位叶子列表及布局转换。
+- 也接受 `QuadLeaf64` 列表：`(u, v)` 是左上角，边长为 `2^lod`，`lod` 在 `0..=6`；坐标必须按边长对齐，叶子不得越界或重叠。`value: NonZeroU16` 是标签，未提供的像素是背景。
+- 输出可选择借用的 `Rectangle` 切片、逐矩形 callback，或调用方持有的 `PackedRectangles64`。范围 `x.start..x.end`、`y.start..y.end` 左闭右开，终点可以是 64；矩形尺寸不受输入叶子的 LOD 限制。
 - 体素调用方负责可见面筛选、方向分层和合并条件；需要区分的属性应反映在输入标签中。本库处理的是二维区域划分。
 
 目标是最少矩形数量。输入不要求预排序或预合并；含孔区域使用同一套精确算法。
@@ -52,7 +52,33 @@ fn main() -> Result<(), SparseQuadError> {
 }
 ```
 
-初始化、借用分解和销毁不调用堆分配器；返回的切片属于 scratch，需在下一次可变使用前消费完毕。scratch 为固定容量内联对象，在 x86_64 上约 **319 KiB**，调用方需为 worker 配置足够的栈并避免按值搬运。资源契约与容量证明见 [scratch 与接口](docs/scratch.md)。
+引擎已有连续标签切面时，直接使用原生布局：
+
+```rust
+use rectangle_decomposition::{
+    DenseLabels64, PackedRectangles64, SparseOptimalScratch64, SparseQuadError,
+};
+
+fn main() -> Result<(), SparseQuadError> {
+    let mut labels = DenseLabels64::new();
+    labels.rows_mut()[0][0] = 65535;
+    let mut scratch = SparseOptimalScratch64::new();
+    let mut output = PackedRectangles64::new();
+    scratch.decompose_labels_packed(&labels, &mut output)?;
+    // bounds 的四个字节依次是 x.start、x.end、y.start、y.end。
+    assert_eq!(output.bounds(), &[u32::from_le_bytes([0, 1, 0, 1])]);
+    assert_eq!(output.labels(), &[65535]);
+    Ok(())
+}
+```
+
+`decompose_labels_borrowed` 返回借用结果；`decompose_labels_into` 可将矩形直接送入 mesh 构建 callback。叶子输入也提供 `decompose_into` 和 `decompose_packed`。直接输出不经过 scratch 的矩形数组；callback 返回错误时立即终止，已输出前缀与失败 callback 的副作用不回滚，scratch 可继续复用。
+
+初始化、借用分解、packed 输出和销毁不调用堆分配器；callback 自身的资源行为由调用方决定。返回的切片属于 scratch，需在下一次可变使用前消费完毕。scratch 为固定容量内联对象，在 x86_64 上为 **264,256 字节，约 258 KiB**，调用方需为 worker 配置足够的栈并避免按值搬运。资源契约与容量证明见 [scratch 与接口](docs/scratch.md)。
+
+叶子数小于 512 时沿用稀疏事件路径；至少 512 个叶子时自动栅格化，再用 512-bit SIMD 构造两轴最大同色区间。原生 `DenseLabels64` 直接进入同一后端，所有入口保持整体 `O(n³)` 上界。
+
+大量单位面适合由上游直接填充标签切面；只有少量大 LOD 块时保留叶子输入，避免扫描整个网格。直接 sink 便于写入下游已有布局，实际收益取决于消费者，不能保证每种输出布局都更快。
 
 也提供拥有输入的 `SparseQuadImage64`、增量输入的 `SparseLayerBuilder64`，以及返回 `Vec<Rectangle>` 的便捷接口；这些拥有型容器可以分配堆内存。库本身没有第三方运行时依赖，库代码禁止 `unsafe`。
 

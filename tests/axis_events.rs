@@ -3,8 +3,8 @@
 use std::num::NonZeroU16;
 
 use rectangle_decomposition::{
-    QuadLeaf64, Rectangle, SparseLayerBuilder64, SparseOptimalScratch64, SparseQuadError,
-    SparseQuadImage64,
+    DenseLabels64, PackedRectangles64, QuadLeaf64, Rectangle, SparseLayerBuilder64,
+    SparseOptimalScratch64, SparseQuadError, SparseQuadImage64,
 };
 
 const fn next_random(state: &mut u64) -> u64 {
@@ -76,6 +76,7 @@ fn compressed_events_match_unit_pixels_for_shuffled_quadtree_layers() -> Result<
     let mut state = 0x6a09_e667_f3bc_c909;
     let mut scratch = SparseOptimalScratch64::new();
     let mut builder = SparseLayerBuilder64::new();
+    let mut packed = PackedRectangles64::new();
     for case in 0..128 {
         let mut leaves = Vec::new();
         for (u, v) in [(0, 0), (32, 0), (0, 32), (32, 32)] {
@@ -96,6 +97,23 @@ fn compressed_events_match_unit_pixels_for_shuffled_quadtree_layers() -> Result<
             .collect();
         let expected_rectangles = scratch.decompose(&pixels)?;
         assert_coverage(&expected_rectangles, &expected_pixels);
+        let mut dense = DenseLabels64::new();
+        for (row, values) in dense
+            .rows_mut()
+            .iter_mut()
+            .zip(expected_pixels.as_chunks::<64>().0)
+        {
+            *row = *values;
+        }
+        assert_eq!(
+            scratch.decompose_labels_borrowed(&dense)?,
+            &expected_rectangles
+        );
+        assert_eq!(
+            scratch.decompose_labels_packed(&dense, &mut packed)?,
+            expected_rectangles.len()
+        );
+        assert!(packed.iter().eq(expected_rectangles.iter().copied()));
         for reverse in [false, true] {
             if reverse {
                 leaves.reverse();
@@ -107,6 +125,20 @@ fn compressed_events_match_unit_pixels_for_shuffled_quadtree_layers() -> Result<
             }
             let image = SparseQuadImage64::from_leaves(&leaves)?;
             assert_eq!(scratch.decompose_borrowed(&leaves)?, &expected_rectangles);
+            let mut direct = Vec::new();
+            assert_eq!(
+                scratch.decompose_into(&leaves, |rectangle| {
+                    direct.push(rectangle);
+                    Ok(())
+                })?,
+                expected_rectangles.len()
+            );
+            assert_eq!(direct, expected_rectangles);
+            assert_eq!(
+                scratch.decompose_packed(&leaves, &mut packed)?,
+                expected_rectangles.len()
+            );
+            assert!(packed.iter().eq(expected_rectangles.iter().copied()));
             assert_eq!(
                 scratch.decompose_quads_borrowed(&image)?,
                 &expected_rectangles

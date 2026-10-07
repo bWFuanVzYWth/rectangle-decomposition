@@ -7,7 +7,8 @@ use std::hint::black_box;
 use std::num::NonZeroU16;
 
 use rectangle_decomposition::{
-    QuadLeaf64, SparseOptimalScratch64, SparseQuadError, SparseQuadImage64,
+    DenseLabels64, PackedRectangles64, QuadLeaf64, SparseOptimalScratch64, SparseQuadError,
+    SparseQuadImage64,
 };
 
 thread_local! {
@@ -188,5 +189,129 @@ fn independent_workers_reuse_stack_storage() -> Result<(), Box<dyn std::error::E
     for worker in workers {
         assert!(matches!(worker.join(), Ok(true)));
     }
+    Ok(())
+}
+
+#[test]
+#[allow(clippy::large_stack_arrays)] // 容量输入、scratch 与 SoA 输出均在栈上初始化和重用。
+fn direct_sink_and_packed_output_do_not_allocate() -> Result<(), SparseQuadError> {
+    start_tracking();
+    {
+        let mut scratch = SparseOptimalScratch64::new();
+        let mut output = PackedRectangles64::new();
+        assert_eq!(std::ptr::from_ref(&output) as usize % 64, 0);
+        assert_eq!(output.bounds().as_ptr() as usize % 64, 0);
+        assert_eq!(output.labels().as_ptr() as usize % 64, 0);
+        let mut leaves = [QuadLeaf64 {
+            u: 0,
+            v: 0,
+            lod: 0,
+            value: NonZeroU16::MIN,
+        }; 4096];
+        for holes in [false, true, false, true] {
+            let mut count = 0;
+            for v in 0..64u8 {
+                for u in 0..64u8 {
+                    if holes && u % 2 == 0 && v % 2 == 0 {
+                        continue;
+                    }
+                    let value = if holes || (u + v) % 2 == 0 {
+                        NonZeroU16::MIN
+                    } else {
+                        NonZeroU16::MAX
+                    };
+                    let Some(slot) = leaves.get_mut(count) else {
+                        return Err(SparseQuadError::CapacityOverflow);
+                    };
+                    *slot = QuadLeaf64 {
+                        u,
+                        v,
+                        lod: 0,
+                        value,
+                    };
+                    count += 1;
+                }
+            }
+            let (input, _) = leaves.split_at(count);
+            let expected = if holes { 1025 } else { 4096 };
+            let mut seen = 0;
+            assert_eq!(
+                scratch.decompose_into(black_box(input), |rectangle| {
+                    assert_ne!(rectangle.value, 0);
+                    seen += 1;
+                    Ok(())
+                })?,
+                expected
+            );
+            assert_eq!(seen, expected);
+            assert_eq!(
+                scratch.decompose_packed(black_box(input), &mut output)?,
+                expected
+            );
+            let borrowed = scratch.decompose_borrowed(input)?;
+            assert!(output.iter().eq(borrowed.iter().copied()));
+        }
+        assert_eq!(
+            scratch.decompose_into(&[], |_| Err(SparseQuadError::Overlap))?,
+            0
+        );
+        assert_eq!(scratch.decompose_packed(&[], &mut output)?, 0);
+        assert!(output.is_empty());
+    }
+    finish_tracking();
+    Ok(())
+}
+
+#[test]
+fn native_labels_and_every_output_path_do_not_allocate() -> Result<(), SparseQuadError> {
+    start_tracking();
+    {
+        let mut labels = DenseLabels64::new();
+        let mut scratch = SparseOptimalScratch64::new();
+        let mut output = PackedRectangles64::new();
+        assert_eq!(std::ptr::from_ref(&labels) as usize % 64, 0);
+        for (pattern, expected) in [(0, 4096), (1, 1025), (2, 1), (3, 0), (0, 4096)] {
+            for (v, row) in labels.rows_mut().iter_mut().enumerate() {
+                for (u, value) in row.iter_mut().enumerate() {
+                    *value = match pattern {
+                        0 if (u + v) % 2 == 0 => 1,
+                        0 | 2 => u16::MAX,
+                        1 if u % 2 == 1 || v % 2 == 1 => 1,
+                        _ => 0,
+                    };
+                }
+            }
+            assert_eq!(
+                scratch.decompose_labels_borrowed(black_box(&labels))?.len(),
+                expected
+            );
+            let mut seen = 0;
+            assert_eq!(
+                scratch.decompose_labels_into(black_box(&labels), |rectangle| {
+                    assert_ne!(rectangle.value, 0);
+                    seen += 1;
+                    Ok(())
+                })?,
+                expected
+            );
+            assert_eq!(seen, expected);
+            assert_eq!(
+                scratch.decompose_labels_packed(black_box(&labels), &mut output)?,
+                expected
+            );
+            let borrowed = scratch.decompose_labels_borrowed(&labels)?;
+            assert!(output.iter().eq(borrowed.iter().copied()));
+        }
+        assert_eq!(
+            scratch.decompose_labels_into(&labels, |_| Err(SparseQuadError::AllocationFailed)),
+            Err(SparseQuadError::AllocationFailed)
+        );
+        assert_eq!(scratch.decompose_labels_borrowed(&labels)?.len(), 4096);
+        labels.clear();
+        assert_eq!(scratch.decompose_labels_borrowed(&labels)?, []);
+        assert_eq!(scratch.decompose_labels_packed(&labels, &mut output)?, 0);
+        assert!(output.is_empty());
+    }
+    finish_tracking();
     Ok(())
 }

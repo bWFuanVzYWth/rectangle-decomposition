@@ -1,6 +1,6 @@
 #![feature(portable_simd)]
 
-//! 将 64x64 带标签像素区域分解为最少同色矩形，输入使用 sparse quad 列表。
+//! 将 64x64 带标签像素区域分解为最少同色矩形，输入为连续标签切面或 sparse quad 列表。
 //!
 //! 几何归约参考 Ferrari、Sankar、Sklansky (1984)，匹配使用 HKDW。
 //! 算法原理、实现地图与完整出处见仓库 README 和 docs/。
@@ -17,11 +17,12 @@ mod sparse;
 mod types;
 
 pub use sparse::{
-    QuadLeaf64, SparseLayerBuilder64, SparseOptimalScratch64, SparseQuadError, SparseQuadImage64,
+    DenseLabels64, QuadLeaf64, SparseLayerBuilder64, SparseOptimalScratch64, SparseQuadError,
+    SparseQuadImage64,
 };
 #[cfg(feature = "profile")]
 pub use sparse::{SparseDecomposeCounts, SparseDecomposeProfile, SparseDecomposeTimings};
-pub use types::Rectangle;
+pub use types::{PackedRectangles64, Rectangle};
 
 pub(crate) fn get<T>(slice: &[T], index: usize) -> &T {
     debug_assert!(index < slice.len());

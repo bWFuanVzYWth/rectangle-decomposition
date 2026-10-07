@@ -17,6 +17,9 @@ pub const IMAGE64_AXIS_LEN: usize = IMAGE64_AXIS_LIMIT + 1;
 pub const IMAGE64_MAX_CONFLICT_EDGES: usize = (IMAGE64_AXIS_LIMIT - 1) * (IMAGE64_AXIS_LIMIT - 1);
 /// 每条内部格线至多有 floor(63 / 2) 条端点互异的同向 chord。
 pub const IMAGE64_MAX_CHORDS: usize = (IMAGE64_AXIS_LIMIT - 1) * ((IMAGE64_AXIS_LIMIT - 1) / 2);
+// 图的固定容量同时约束 CSR 末尾 offset、扫描游标和 DFS 顶点编号。
+const _: () = assert!(IMAGE64_MAX_CONFLICT_EDGES < 65_535);
+const _: () = assert!(IMAGE64_MAX_CHORDS < 65_535);
 pub type ChordBuffer<T> = FixedVec<T, IMAGE64_MAX_CHORDS>;
 
 #[cfg(test)]
@@ -61,7 +64,7 @@ pub struct SparseEdge {
 
 #[derive(Clone, Copy, Debug)]
 pub struct SparseAdjacencyRef<'a> {
-    pub(super) offsets: &'a [usize],
+    pub(super) offsets: &'a [u16],
     pub(super) edges: &'a [u16],
 }
 
@@ -70,11 +73,11 @@ pub struct ConflictFinalizeScratch {
     /// 构图时暂存横向起止事件的 next 和纵向查询的 next；CSR 阶段复用为
     /// 右顶点的边段起点及按 (度数, 编号) 排序的右顶点。
     pub(super) right_layout: FixedVec<u32, { 2 * IMAGE64_MAX_CHORDS }>,
-    pub(super) next_offsets: ChordBuffer<usize>,
+    pub(super) next_offsets: ChordBuffer<u16>,
     pub(super) edge_buffer: [SparseEdge; IMAGE64_MAX_CONFLICT_EDGES],
     pub(super) edge_count: usize,
     pub(super) right_degrees: ChordBuffer<u8>,
-    pub(super) adjacency_offsets: FixedVec<usize, { IMAGE64_MAX_CHORDS + 1 }>,
+    pub(super) adjacency_offsets: FixedVec<u16, { IMAGE64_MAX_CHORDS + 1 }>,
     pub(super) adjacency_edges: FixedVec<u16, IMAGE64_MAX_CONFLICT_EDGES>,
     pub(super) horizontal_start_heads: [u16; IMAGE64_AXIS_LEN],
     pub(super) horizontal_end_heads: [u16; IMAGE64_AXIS_LEN],
@@ -127,13 +130,13 @@ pub struct HkScratch {
     /// 搜索时保存本轮访问标记，结束后编码左侧选中、右侧排除状态。
     pub(super) reachable_left: ChordBuffer<bool>,
     pub(super) reachable_right: ChordBuffer<bool>,
-    pub(super) transpose_offsets: FixedVec<usize, { IMAGE64_MAX_CHORDS + 1 }>,
+    pub(super) transpose_offsets: FixedVec<u16, { IMAGE64_MAX_CHORDS + 1 }>,
     pub(super) transpose_edges: FixedVec<u16, IMAGE64_MAX_CONFLICT_EDGES>,
     /// 转置 CSR 写入游标；构造完成后复用为长度 3 增广的左邻接扫描游标。
-    pub(super) write_offsets: ChordBuffer<usize>,
+    pub(super) write_offsets: ChordBuffer<u16>,
     pub(super) right_order: ChordBuffer<u16>,
     pub(super) right_degree_counts: FixedVec<usize, IMAGE64_AXIS_LIMIT>,
-    pub(super) dfs_stack: ChordBuffer<(usize, usize)>,
+    pub(super) dfs_stack: ChordBuffer<(u16, u16)>,
 }
 
 impl HkScratch {
@@ -181,7 +184,7 @@ impl SparseAdjacencyRef<'_> {
     pub(super) fn neighbors(&self, left: usize) -> &[u16] {
         slice(
             self.edges,
-            copy(self.offsets, left)..copy(self.offsets, left + 1),
+            usize::from(copy(self.offsets, left))..usize::from(copy(self.offsets, left + 1)),
         )
     }
 }

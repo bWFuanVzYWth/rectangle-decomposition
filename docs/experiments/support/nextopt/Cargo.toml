@@ -1,0 +1,21 @@
+[package]
+name = "nextopt_reproduction"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+before = { package = "rectangle_decomposition_nextopt_before", path = "../../../../target/nextopt-before" }
+after = { package = "rectangle_decomposition", path = "../../../.." }
+
+[[bin]]
+name = "nextopt-comparison"
+path = "main.rs"
+
+[[bin]]
+name = "nextopt-bulk-comparison"
+path = "bulk.rs"
+
+[[bin]]
+name = "nextopt-seed-comparison"
+path = "seeds.rs"

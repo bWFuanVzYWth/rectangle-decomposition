@@ -6,12 +6,21 @@
 
 | 场景 | 入口 | 内存行为 |
 | --- | --- | --- |
+| 上游直接提供行主序标签切面 | `scratch.decompose_labels_borrowed(&labels)` | 输入无需叶子校验，借用输出，内部不分配 |
 | 已有叶子切片，直接分解 | `scratch.decompose_borrowed(&leaves)` | 校验输入，借用输出，内部不分配 |
+| 每个矩形立即写入 mesh | `decompose_labels_into`、`decompose_into` | 直接调用 sink，不写中间矩形数组；sink 自身可分配 |
+| 下游批量消费 packed bounds / labels | `decompose_labels_packed`、`decompose_packed` | 直接写入调用方的固定容量 `PackedRectangles64`，内部不分配 |
 | 重复使用一个拥有型输入对象 | `SparseQuadImage64::from_leaves` + `decompose_quads_borrowed` | image 构造分配；借用分解不分配 |
 | 希望独立保存返回结果 | `decompose`、`decompose_quads` | 将内部结果复制为 `Vec<Rectangle>`，可以分配 |
 | 逐个提供正方形 | `SparseLayerBuilder64::push_square` + `finish` | builder 保存叶子，返回拥有型结果，可以分配 |
 
-`SparseQuadImage64` 保存校验后的叶子，不缓存分解结果；内部每个记录为 8 字节，保存叶子与 u16 Morton 起点，终点由 LOD 推出。两种借用入口共用轴区间与匹配算法。builder 保存 leaves，单个正方形在加入时校验形状，重叠在 `finish` 时检查；`finish` 不清空输入，开始下一层前调用 builder 的 `clear()`。
+`DenseLabels64` 为 64 字节对齐的 `[[u16; 64]; 64]`，占 8192 字节，无自有堆缓冲。标签 0 是背景，其余全部 u16 值均合法；上游可直接写入 `rows_mut()`。`new()` 与 `clear()` 将标签置零，均不分配。
+
+`SparseQuadImage64` 保存校验后的叶子，不缓存分解结果；内部每个记录为 8 字节，保存叶子与 u16 Morton 起点，终点由 LOD 推出。所有入口共用最大同色轴区间、匹配和分区后端；叶子数小于 512 使用起点事件桶，至少 512 时栅格化到 scratch 内的标签切面。原生 grid 输入省去叶子列表、形状／重叠校验及转换。builder 保存 leaves，单个正方形在加入时校验形状，重叠在 `finish` 时检查；`finish` 不清空输入，开始下一层前调用 builder 的 `clear()`。
+
+`PackedRectangles64` 为 64 字节对齐的固定容量输出，最多保存 4096 个矩形。`bounds()` 为连续 u32 数组，`labels()` 为连续 u16 数组；每个 bounds 的低到高字节依次是 `x.start, x.end, y.start, y.end`。范围左闭右开，终点可为 64。`iter()` 解码为 `Rectangle`，`clear()` 只重置长度；packed 分解在调用开始时清空旧结果。
+
+直接 sink 输出与借用输出顺序一致。叶子输入校验失败时不调用 sink；sink 返回错误会立即终止，已接受前缀及失败 callback 的副作用不回滚。packed 输出失败时保留本次已完成前缀，后续分解可继续复用 scratch；调用方应自行决定是否保留前缀。
 
 `SparseOptimalScratch64::new()` 直接创建可用缓存，`Default` 等价。旧的 `preallocate_64()` 是兼容空操作，`try_new_preallocated()` 等价于 `Ok(new())`；新代码直接使用 `new()`。
 
@@ -19,7 +28,7 @@
 
 scratch 内部全部为固定容量、已初始化的数组，没有 `Vec`、`Box` 或指向自有堆缓冲的指针。`FixedVec<T, N>` 使用 `[T; N] + len`，只接受 `Copy` 元素；清空仅重置有效长度，算法按需重置配对和标记。
 
-因此构造、两个借用分解入口和析构都不调用堆分配器。输出切片位于 scratch 对象内部，下一次可变使用会覆盖它，必须事先消费完毕。这一契约不包含调用方构造输入、保存结果或写入 mesh 时的分配。
+因此构造、所有借用分解入口、packed 输出和析构都不调用堆分配器。借用输出切片位于 scratch 对象内部，下一次可变使用会覆盖它，必须事先消费完毕。直接 sink 与 packed 输出不写入这份中间矩形数组；packed 缓冲由调用方持有，可以跨 scratch 调用保留。这一契约不包含调用方构造拥有型输入、保存结果或 sink 写入 mesh 时的分配。
 
 ## 固定容量从哪里来
 
@@ -43,15 +52,17 @@ scratch 内部全部为固定容量、已初始化的数组，没有 `Vec`、`Bo
 
 **搜索缓冲上界。** 队列和显式 DFS 路径长度不超过一侧顶点数。最短层根可以重复，但每次记录都来自一条被扫描的冲突边，长度至多为 `E`。CSR 的偏移数组还需为末尾哨兵多留一个槽。
 
+64×64 的顶点编号、CSR 偏移、转置写入／预热游标和 DFS 栈均可存为 u16，容量静态断言保证有效索引及末尾偏移小于 65535。推广尺寸时须重新选择足够的整数宽度，不能依赖截断。
+
 这些性质使整个 scratch 的空间为 `O(n²)`。全局图直接复用原有按全图容量配置的匹配缓存，删除颜色组元数据和排序顺序字段，不增加搜索数组。
 
 ## 线程栈怎样核算
 
-当前 x86_64 布局下，`size_of::<SparseOptimalScratch64>()` 为 **326,336 字节，约 319 KiB**。扫线事件复用 CSR 临时缓冲并去掉编号网格和轮次标记，稳定行带仅增加两个边界位图；长度 3 增广游标也复用已有缓冲。这是对象大小，不是任意调用链的栈峰值或稳定 ABI；编译器布局、平台和字段变化都可能影响它。
+当前 x86_64 布局下，`size_of::<SparseOptimalScratch64>()` 为 **264,256 字节，约 258 KiB**，包含 8192 字节的自动栅格化标签切面。匹配的 CSR 偏移、扫描游标和 DFS 栈使用 u16；扫线事件复用 CSR 临时缓冲，长度 3 增广游标复用转置写入缓冲。这是对象大小，不是任意调用链的栈峰值或稳定 ABI；编译器布局、平台和字段变化都可能影响它。
 
 拥有型 image 的大乱序输入排序使用 **16 KiB 临时栈数组**，不位于 scratch 内，不用于普通借用分解；小输入和已排序输入不走此路径。image 的叶子 Vec 仍允许堆分配，但无需第二个排序 Vec。
 
-批量 Morton 编码另用固定局部 staging 和 512-bit portable SIMD 数据向量，也不增加堆分配或 scratch 字段；逻辑向量宽度不代表目标机器具有对应硬件寄存器。实际调用栈峰值仍取决于编译器的拆分、spill 和内联选择。
+批量 Morton 编码另用固定局部 staging 和 512-bit portable SIMD 数据向量，不增加堆分配；连续标签切面也使用 512-bit u16 数据向量比较相邻像素及行。逻辑向量宽度不代表目标机器具有对应硬件寄存器。实际调用栈峰值仍取决于编译器的拆分、spill 和内联选择。调用方持有的 `DenseLabels64` 和 `PackedRectangles64` 也应计入所在栈帧。
 
 profile/test 的逻辑标签计数使用额外 **8 KiB 临时位集**，不在 scratch 对象内；普通借用分解不执行这项计数。它仍不分配堆内存，但应计入 profile 调用链的栈预算。
 

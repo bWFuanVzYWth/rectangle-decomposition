@@ -1,0 +1,5 @@
+input,entry,before_ms,after_ms,delta_q25_pct,delta_median_pct,delta_q75_pct
+checkerboard_chunk_195_planes,leaves_consumer, 12.048,9.644,-21.13,-19.05,-17.82
+checkerboard_chunk_195_planes,leaves_sink, 12.163,9.839,-20.73,-18.55,-16.40
+checkerboard_chunk_195_planes,native_grid_sink, 12.137,8.877,-27.52,-25.39,-22.42
+checkerboard_chunk_195_planes,producer_grid_sink, 12.026,9.442,-23.38,-22.45,-19.59
