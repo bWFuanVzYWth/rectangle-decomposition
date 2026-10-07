@@ -1,3 +1,5 @@
+#![feature(portable_simd)]
+
 //! 将 64x64 带标签像素区域分解为最少同色矩形，输入使用 sparse quad 列表。
 //!
 //! 几何归约参考 Ferrari、Sankar、Sklansky (1984)，匹配使用 HKDW。

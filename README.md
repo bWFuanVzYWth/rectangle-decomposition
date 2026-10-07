@@ -19,6 +19,8 @@
 
 将本仓库作为 Cargo 的本地 `path` 依赖加入项目，路径按实际位置调整：
 
+当前 SIMD 实验使用 nightly 的 `std::simd`（`portable_simd`），需要 nightly Rust 工具链；显式 SIMD 数据向量统一为 512 bit。无需 AVX-512，编译器可将逻辑向量拆为目标平台支持的较窄指令。
+
 ```toml
 [dependencies]
 rectangle_decomposition = { path = "../rectangle_decomposition" }

@@ -4,13 +4,14 @@
 //! 不创建 dense 像素图。
 
 use std::num::NonZeroU16;
+use std::simd::u16x32;
 #[cfg(feature = "profile")]
 use std::time::{Duration, Instant};
 
 use crate::fixed::FixedVec;
 use crate::matching::{ChordBuffer, MatchingScratch};
 use crate::types::{ActiveRect, ChordAccess, EffectiveChord, Orientation, RangeU8, Rectangle, Run};
-use crate::{get, slice};
+use crate::{get, slice, slice_mut};
 
 const EDGE: usize = 64;
 const EDGE_U8: u8 = 64;
@@ -152,11 +153,25 @@ impl SparseQuadImage64 {
 
         let mut ordered = true;
         let mut previous_start = 0u16;
-        for &leaf in leaves {
-            let validated = validate_leaf(leaf)?;
-            ordered &= previous_start <= validated.morton_start;
-            previous_start = validated.morton_start;
-            stored.push(validated);
+        if leaves.len() < EDGE {
+            for &leaf in leaves {
+                let validated = validate_leaf(leaf)?;
+                ordered &= previous_start <= validated.morton_start;
+                previous_start = validated.morton_start;
+                stored.push(validated);
+            }
+        } else {
+            let mut morton_starts = [0u16; EDGE];
+            for chunk in leaves.chunks(EDGE) {
+                batch_morton_starts(chunk, &mut morton_starts);
+                for (&leaf, &morton_start) in chunk.iter().zip(&morton_starts) {
+                    // 键计算没有 shape 错误；仍按输入顺序返回首个非法 leaf。
+                    validate_leaf_shape(leaf)?;
+                    ordered &= previous_start <= morton_start;
+                    previous_start = morton_start;
+                    stored.push(StoredLeaf { leaf, morton_start });
+                }
+            }
         }
 
         if !ordered {
@@ -696,6 +711,28 @@ fn sort_stored_leaves_by_morton(leaves: &mut [StoredLeaf]) -> Result<(), SparseQ
         }
     }
     Ok(())
+}
+
+fn batch_morton_starts(leaves: &[QuadLeaf64], starts: &mut [u16; EDGE]) {
+    for (chunk, output) in leaves.chunks(32).zip(starts.chunks_mut(32)) {
+        let mut coordinates_u = [0u16; 32];
+        let mut coordinates_v = [0u16; 32];
+        for ((leaf, u), v) in chunk.iter().zip(&mut coordinates_u).zip(&mut coordinates_v) {
+            *u = u16::from(leaf.u);
+            *v = u16::from(leaf.v);
+        }
+
+        // 每个数据向量均为 32 个 u16（512 bit）；补零尾部不会写回有效范围外。
+        let spread = |value: u16x32| {
+            let value = (value | (value << 4)) & u16x32::splat(0x0f0f);
+            let value = (value | (value << 2)) & u16x32::splat(0x3333);
+            (value | (value << 1)) & u16x32::splat(0x5555)
+        };
+        let keys = (spread(u16x32::from_array(coordinates_u))
+            | (spread(u16x32::from_array(coordinates_v)) << 1))
+            .to_array();
+        slice_mut(output, 0..chunk.len()).copy_from_slice(slice(&keys, 0..chunk.len()));
+    }
 }
 
 fn validate_leaf(leaf: QuadLeaf64) -> Result<StoredLeaf, SparseQuadError> {

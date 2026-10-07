@@ -312,6 +312,14 @@ fn bench_representative_inputs(c: &mut Criterion) {
                 ))))
             });
         });
+        group.bench_function(BenchmarkId::new("construct_and_decompose", name), |b| {
+            b.iter(|| {
+                let fresh_image = require_ok(SparseQuadImage64::from_leaves(black_box(&leaves)));
+                black_box(
+                    require_ok(scratch.decompose_quads_borrowed(black_box(&fresh_image))).len(),
+                );
+            });
+        });
         group.bench_function(BenchmarkId::new("builder_layer", name), |b| {
             b.iter(|| {
                 builder.clear();

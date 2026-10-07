@@ -77,11 +77,11 @@ cargo fmt --check
 
 | 命令 | 观察范围 |
 | --- | --- |
-| `cargo bench --bench worst_case` | 含孔图及十一类图案：两种借用分解、image 构造、builder 整层构建；另测 scratch 初始化 |
+| `cargo bench --bench worst_case` | 含孔图及十一类图案：两种借用分解、image 构造、构造后立即分解、builder 整层构建；另测 scratch 初始化 |
 | `cargo run --release --features profile --example worst_case_profile` | 轴区间、chord、匹配与分区的阶段耗时和规模 |
 | `cargo run --release --example low_discrepancy_1000` | 一组含孔输入的平均／最大耗时，以及最慢样本的矩形数 |
 
-`worst_case` 是基准名称，不是全局最坏输入的数学证明。`representative_64` 用确定性输入覆盖两个借用入口、拥有型 image 构造和 builder 整层构建，包括大 LOD、规则块、混合 LOD 行带、条纹、双色棋盘格、最大 chord 孔洞、稀疏／密集随机、稠密边框冲突、颜色小组和逆序单位像素。计时前检查入口矩形数一致及简单图案的已知最优数；分解失败会使基准退出，不能当作零矩形计时。
+`worst_case` 是基准名称，不是全局最坏输入的数学证明。`representative_64` 用确定性输入覆盖两个借用入口、拥有型 image 构造、构造后立即分解和 builder 整层构建，包括大 LOD、规则块、混合 LOD 行带、条纹、双色棋盘格、最大 chord 孔洞、稀疏／密集随机、稠密边框冲突、颜色小组和逆序单位像素。计时前检查入口矩形数一致及简单图案的已知最优数；分解失败会使基准退出，不能当作零矩形计时。
 
 热路径测量应在计时外构造输入、复用 scratch，并消费返回结果；构造、输出复制和多线程场景另行测量。对比版本使用相同工具链、编译选项和样本，轮换运行顺序，保留分布而非只报最小值。阶段计时用于定位，总收益以不带阶段计时的完整调用为准。
 
@@ -92,3 +92,5 @@ profile 的 `chord_groups` 仍统计有 chord 的不同标签数，计数仅发�
 区间位图与单调增广游标的实测结果、噪声排查和小输入取舍见 [2026-10-08 实验记录](experiments/algorithm-2026-10-08.md)。
 
 后续的叶子事件、稳定行带、有限键排序、Builder 和冲突扫线测量见 [非匹配阶段实验记录](experiments/nonmatching-2026-10-08.md)。
+
+固定 512-bit `std::simd` Morton 编码的局部收益、完整 pipeline 测量、nightly 要求和未保留尝试见 [SIMD 实验记录](experiments/simd512-2026-10-08.md)。SIMD 不增加原算法的工作量时保持现有复杂度；换成稠密扫描则必须重新证明上界。
