@@ -50,7 +50,7 @@ fn main() -> Result<(), SparseQuadError> {
 }
 ```
 
-初始化、借用分解和销毁不调用堆分配器；返回的切片属于 scratch，需在下一次可变使用前消费完毕。scratch 为固定容量内联对象，在 x86_64 上约 **326 KiB**，调用方需为 worker 配置足够的栈并避免按值搬运。资源契约与容量证明见 [scratch 与接口](docs/scratch.md)。
+初始化、借用分解和销毁不调用堆分配器；返回的切片属于 scratch，需在下一次可变使用前消费完毕。scratch 为固定容量内联对象，在 x86_64 上约 **319 KiB**，调用方需为 worker 配置足够的栈并避免按值搬运。资源契约与容量证明见 [scratch 与接口](docs/scratch.md)。
 
 也提供拥有输入的 `SparseQuadImage64`、增量输入的 `SparseLayerBuilder64`，以及返回 `Vec<Rectangle>` 的便捷接口；这些拥有型容器可以分配堆内存。库本身没有第三方运行时依赖，库代码禁止 `unsafe`。
 

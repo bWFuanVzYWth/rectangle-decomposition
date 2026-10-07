@@ -87,7 +87,12 @@ fn initialize_matching(
     scratch.pair_right.resize(right_size, UNMATCHED_U16);
     // 初始化同时构造转置 CSR，反向 BFS 直接复用它。
     greedy_initialize_sparse_matching_csr_u16(adjacency, right_degrees, scratch);
-    greedy_augment_len3_sparse_csr_u16(adjacency, &mut scratch.pair_left, &mut scratch.pair_right);
+    greedy_augment_len3_sparse_csr_u16(
+        adjacency,
+        &mut scratch.pair_left,
+        &mut scratch.pair_right,
+        &mut scratch.write_offsets,
+    );
 }
 
 fn initialize_search(scratch: &mut HkScratch) {

@@ -9,9 +9,9 @@
 | 已有叶子切片，直接分解 | `scratch.decompose_borrowed(&leaves)` | 校验输入，借用输出，内部不分配 |
 | 重复使用一个拥有型输入对象 | `SparseQuadImage64::from_leaves` + `decompose_quads_borrowed` | image 构造分配；借用分解不分配 |
 | 希望独立保存返回结果 | `decompose`、`decompose_quads` | 将内部结果复制为 `Vec<Rectangle>`，可以分配 |
-| 逐个提供正方形 | `SparseLayerBuilder64::push_square` + `finish` | builder 拥有区间列表，返回拥有型结果，可以分配 |
+| 逐个提供正方形 | `SparseLayerBuilder64::push_square` + `finish` | builder 保存叶子，返回拥有型结果，可以分配 |
 
-`SparseQuadImage64` 保存校验后的叶子，不缓存分解结果；两种借用入口共用轴区间与匹配算法。builder 的单个正方形在加入时校验形状，重叠在 `finish` 时检查；`finish` 不清空输入，开始下一层前调用 builder 的 `clear()`。
+`SparseQuadImage64` 保存校验后的叶子，不缓存分解结果；内部每个记录为 8 字节，保存叶子与 u16 Morton 起点，终点由 LOD 推出。两种借用入口共用轴区间与匹配算法。builder 保存 leaves，单个正方形在加入时校验形状，重叠在 `finish` 时检查；`finish` 不清空输入，开始下一层前调用 builder 的 `clear()`。
 
 `SparseOptimalScratch64::new()` 直接创建可用缓存，`Default` 等价。旧的 `preallocate_64()` 是兼容空操作，`try_new_preallocated()` 等价于 `Ok(new())`；新代码直接使用 `new()`。
 
@@ -47,7 +47,9 @@ scratch 内部全部为固定容量、已初始化的数组，没有 `Vec`、`Bo
 
 ## 线程栈怎样核算
 
-当前 x86_64 布局下，`size_of::<SparseOptimalScratch64>()` 为 **334,144 字节，约 326 KiB**。这是对象大小，不是任意调用链的栈峰值或稳定 ABI；编译器布局、平台和字段变化都可能影响它。
+当前 x86_64 布局下，`size_of::<SparseOptimalScratch64>()` 为 **326,336 字节，约 319 KiB**。扫线事件复用 CSR 临时缓冲并去掉编号网格和轮次标记，稳定行带仅增加两个边界位图；长度 3 增广游标也复用已有缓冲。这是对象大小，不是任意调用链的栈峰值或稳定 ABI；编译器布局、平台和字段变化都可能影响它。
+
+拥有型 image 的大乱序输入排序使用 **16 KiB 临时栈数组**，不位于 scratch 内，不用于普通借用分解；小输入和已排序输入不走此路径。image 的叶子 Vec 仍允许堆分配，但无需第二个排序 Vec。
 
 profile/test 的逻辑标签计数使用额外 **8 KiB 临时位集**，不在 scratch 对象内；普通借用分解不执行这项计数。它仍不分配堆内存，但应计入 profile 调用链的栈预算。
 
@@ -58,6 +60,6 @@ profile/test 的逻辑标签计数使用额外 **8 KiB 临时位集**，不在 s
 ## 修改存储布局时要守住的契约
 
 - 合法输入不能依赖溢出后扩容；每个容量都应有几何或搜索上界。
-- 未激活数组槽不应参与算法。格点编号的读取由本轮列标记和位图共同保护。
+- 未激活数组槽不应参与算法。扫线编号的读取由当前活动位图保护，稳定行只共享已生成的有效区间。
 - 内联数组的所有元素始终已初始化；零初值有利于整块清零构造，但不把某条汇编指令视为接口保证。
 - 除了计量对象大小，还应验证零分配、借用输出地址、标记复用和 worker 栈测试。

@@ -10,7 +10,7 @@ use std::time::{Duration, Instant};
 use crate::fixed::FixedVec;
 use crate::matching::{ChordBuffer, MatchingScratch};
 use crate::types::{ActiveRect, ChordAccess, EffectiveChord, Orientation, RangeU8, Rectangle, Run};
-use crate::{get, slice, slice_mut};
+use crate::{get, slice};
 
 const EDGE: usize = 64;
 const EDGE_U8: u8 = 64;
@@ -128,8 +128,14 @@ pub struct SparseQuadImage64 {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StoredLeaf {
     leaf: QuadLeaf64,
-    morton_start: u64,
-    morton_end: u64,
+    morton_start: u16,
+}
+
+impl StoredLeaf {
+    const fn morton_end(self) -> u16 {
+        // 已验证的 dyadic square 占据一个连续 Morton 区间，终点最多为 4096。
+        self.morton_start + (1u16 << (self.leaf.lod * 2))
+    }
 }
 
 impl SparseQuadImage64 {
@@ -144,17 +150,24 @@ impl SparseQuadImage64 {
         let mut stored = Vec::new();
         allocate_exact(&mut stored, leaves.len())?;
 
+        let mut ordered = true;
+        let mut previous_start = 0u16;
         for &leaf in leaves {
-            stored.push(validate_leaf(leaf)?);
+            let validated = validate_leaf(leaf)?;
+            ordered &= previous_start <= validated.morton_start;
+            previous_start = validated.morton_start;
+            stored.push(validated);
         }
 
-        stored.sort_unstable_by_key(|leaf| leaf.morton_start);
-        let mut previous_end = None::<u64>;
+        if !ordered {
+            sort_stored_leaves_by_morton(&mut stored)?;
+        }
+        let mut previous_end = 0u16;
         for leaf in &stored {
-            if previous_end.is_some_and(|end| end > leaf.morton_start) {
+            if previous_end > leaf.morton_start {
                 return Err(SparseQuadError::Overlap);
             }
-            previous_end = Some(leaf.morton_end);
+            previous_end = leaf.morton_end();
         }
 
         Ok(Self { leaves: stored })
@@ -321,8 +334,8 @@ impl SparseOptimalScratch64 {
 
         let counts_after_extract = SparseDecomposeCounts {
             leaves: leaves.len(),
-            row_intervals: self.rows.intervals.len(),
-            column_intervals: self.columns.intervals.len(),
+            row_intervals: self.rows.logical_interval_count(),
+            column_intervals: self.columns.logical_interval_count(),
             chord_groups: self.chord_groups.logical_group_count(),
             horizontal_chords: self.chord_groups.horizontal.len(),
             vertical_chords: self.chord_groups.vertical.len(),
@@ -398,10 +411,6 @@ impl SparseOptimalScratch64 {
             &mut self.column_buckets,
         )?;
         self.decompose_intervals_borrowed()
-    }
-
-    fn decompose_intervals(&mut self) -> Result<Vec<Rectangle>, SparseQuadError> {
-        Ok(self.decompose_intervals_borrowed()?.to_vec())
     }
 
     fn decompose_intervals_borrowed(&mut self) -> Result<&[Rectangle], SparseQuadError> {
@@ -533,7 +542,7 @@ impl SparseOptimalScratch64 {
 
     #[allow(clippy::mut_mut)] // Swap buffer references, not the inline array contents.
     fn sparse_partition(&mut self) -> Result<&[Rectangle], SparseQuadError> {
-        build_cut_masks(
+        let cut_boundaries = build_cut_masks(
             &self.horizontal_cuts,
             &self.vertical_cuts,
             &mut self.horizontal_cut_masks,
@@ -562,7 +571,10 @@ impl SparseOptimalScratch64 {
             active.push(ActiveRect::new(run.value, run.x_start, run.x_end, 0));
         }
 
-        for y in 1u8..EDGE_U8 {
+        let mut boundaries = (rows.boundaries | cut_boundaries) & !1u64;
+        while boundaries != 0 {
+            let y = u8::try_from(boundaries.trailing_zeros())
+                .map_err(|_| SparseQuadError::CapacityOverflow)?;
             let y_index = usize::from(y);
             let Some(&row_vertical_cut_mask) = vertical_cut_masks.get(y_index) else {
                 return Err(SparseQuadError::CapacityOverflow);
@@ -581,6 +593,7 @@ impl SparseOptimalScratch64 {
             )?;
             // 交换视图，避免逐行复制两个内联数组。
             std::mem::swap(&mut active, &mut next_active);
+            boundaries &= boundaries - 1;
         }
 
         for &active_rect in active.as_slice() {
@@ -593,13 +606,11 @@ impl SparseOptimalScratch64 {
 
 /// 固定 64x64 sparse layer 的增量构建器。
 ///
-/// 只接受非零 dyadic square。builder 内部直接维护 row / column interval list，
+/// 只接受非零 dyadic square。builder 内部保留未展开的 leaves，
 /// 不创建 dense image，也不要求调用方预合并相邻 square。
 #[derive(Debug, Default)]
 pub struct SparseLayerBuilder64 {
-    row_intervals: Vec<LineInterval>,
-    column_intervals: Vec<LineInterval>,
-    square_count: usize,
+    leaves: Vec<QuadLeaf64>,
 }
 
 impl SparseLayerBuilder64 {
@@ -609,9 +620,7 @@ impl SparseLayerBuilder64 {
     }
 
     pub fn clear(&mut self) {
-        self.row_intervals.clear();
-        self.column_intervals.clear();
-        self.square_count = 0;
+        self.leaves.clear();
     }
 
     /// 写入一个非零 dyadic square。
@@ -626,15 +635,10 @@ impl SparseLayerBuilder64 {
         lod: u8,
         value: NonZeroU16,
     ) -> Result<(), SparseQuadError> {
-        push_leaf_line_intervals(
-            QuadLeaf64 { u, v, lod, value },
-            &mut self.row_intervals,
-            &mut self.column_intervals,
-        )?;
-        self.square_count = self
-            .square_count
-            .checked_add(1)
-            .ok_or(SparseQuadError::CapacityOverflow)?;
+        let leaf = QuadLeaf64 { u, v, lod, value };
+        validate_leaf_shape(leaf)?;
+        allocate_more(&mut self.leaves, 1)?;
+        self.leaves.push(leaf);
         Ok(())
     }
 
@@ -647,36 +651,59 @@ impl SparseLayerBuilder64 {
         &mut self,
         scratch: &mut SparseOptimalScratch64,
     ) -> Result<Vec<Rectangle>, SparseQuadError> {
-        if self.square_count == 0 {
+        if self.leaves.is_empty() {
             return Ok(Vec::new());
         }
 
-        build_axis_intervals_from_line_intervals(&mut self.row_intervals, &mut scratch.rows, true)?;
-        build_axis_intervals_from_line_intervals(
-            &mut self.column_intervals,
-            &mut scratch.columns,
-            false,
-        )?;
-        scratch.decompose_intervals()
+        scratch.decompose(&self.leaves)
     }
 }
 
 // Leaf 校验
 
+// 12 bit Morton 键直接映射源位置，再转成目的位置置换；每次交换固定一个位置。
+// 小输入比较排序有固定上限，避免初始化和扫描 4096 键的常数代价。
+fn sort_stored_leaves_by_morton(leaves: &mut [StoredLeaf]) -> Result<(), SparseQuadError> {
+    if leaves.len() <= EDGE {
+        leaves.sort_unstable_by_key(|leaf| leaf.morton_start);
+        return Ok(());
+    }
+    if leaves.len() > MAX_AXIS_INTERVALS {
+        return Err(SparseQuadError::Overlap);
+    }
+    let mut source_for_key = [0u16; MAX_AXIS_INTERVALS];
+    for (source, leaf) in leaves.iter().enumerate() {
+        let slot = crate::get_mut(&mut source_for_key, usize::from(leaf.morton_start));
+        if *slot != 0 {
+            return Err(SparseQuadError::Overlap);
+        }
+        // 0 表示键缺席，非零源位置编码为 index + 1，最大为 4096。
+        *slot = crate::u16_index(source + 1);
+    }
+    let mut destination_for_source = [0u16; MAX_AXIS_INTERVALS];
+    let mut rank = 0u16;
+    for &source in &source_for_key {
+        if source != 0 {
+            *crate::get_mut(&mut destination_for_source, usize::from(source - 1)) = rank;
+            rank += 1;
+        }
+    }
+    for source in 0..leaves.len() {
+        while usize::from(*get(&destination_for_source, source)) != source {
+            let destination = usize::from(*get(&destination_for_source, source));
+            leaves.swap(source, destination);
+            destination_for_source.swap(source, destination);
+        }
+    }
+    Ok(())
+}
+
 fn validate_leaf(leaf: QuadLeaf64) -> Result<StoredLeaf, SparseQuadError> {
     validate_leaf_shape(leaf)?;
 
-    let morton_start = crate::morton::encode(leaf.u, leaf.v);
-    let morton_len = 1u64 << (u32::from(leaf.lod) * 2);
-    let Some(morton_end) = morton_start.checked_add(morton_len) else {
-        return Err(SparseQuadError::CapacityOverflow);
-    };
-
-    Ok(StoredLeaf {
-        leaf,
-        morton_start,
-        morton_end,
-    })
+    let morton_start = u16::try_from(crate::morton::encode(leaf.u, leaf.v))
+        .map_err(|_| SparseQuadError::CapacityOverflow)?;
+    Ok(StoredLeaf { leaf, morton_start })
 }
 
 fn validate_leaf_shape(leaf: QuadLeaf64) -> Result<u8, SparseQuadError> {
@@ -712,10 +739,10 @@ struct Interval {
     value: u16,
 }
 
-/// 行内有效区间为 `items[..len]`，最多 64 个；清空只重置长度。
+/// 区间直接存入起点对应的槽；位图记录占用，清空只重置位图。
 struct IntervalBucket {
     items: [Interval; EDGE],
-    len: u8,
+    starts: u64,
 }
 
 impl IntervalBucket {
@@ -726,25 +753,23 @@ impl IntervalBucket {
                 end: 0,
                 value: 0,
             }; EDGE],
-            len: 0,
+            starts: 0,
         }
     }
 
     fn try_push(&mut self, interval: Interval) -> Result<(), SparseQuadError> {
         let slot = self
             .items
-            .get_mut(usize::from(self.len))
-            .ok_or(SparseQuadError::Overlap)?;
+            .get_mut(usize::from(interval.start))
+            .ok_or(SparseQuadError::CapacityOverflow)?;
+        let bit = 1u64 << u32::from(interval.start);
+        if self.starts & bit != 0 {
+            return Err(SparseQuadError::Overlap);
+        }
         *slot = interval;
-        self.len += 1;
+        self.starts |= bit;
         Ok(())
     }
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-struct LineInterval {
-    line: u8,
-    interval: Interval,
 }
 
 #[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
@@ -756,6 +781,7 @@ struct LineRange {
 struct AxisIntervals {
     lines: FixedVec<LineRange, EDGE>,
     intervals: FixedVec<Interval, MAX_AXIS_INTERVALS>,
+    boundaries: u64,
 }
 
 impl AxisIntervals {
@@ -763,12 +789,14 @@ impl AxisIntervals {
         Self {
             lines: FixedVec::new(LineRange { start: 0, end: 0 }),
             intervals: FixedVec::new(EMPTY_INTERVAL),
+            boundaries: 0,
         }
     }
 
     fn clear_for_build(&mut self) -> Result<(), SparseQuadError> {
         self.lines.clear();
         self.intervals.clear();
+        self.boundaries = 0;
         reserve_exact(&self.lines, EDGE)?;
         self.lines.resize(EDGE, LineRange::default());
         Ok(())
@@ -777,6 +805,12 @@ impl AxisIntervals {
     fn line(&self, index: usize) -> &[Interval] {
         let range = get(&self.lines, index);
         slice(&self.intervals, range.start..range.end)
+    }
+
+    // profiling 仍统计所有像素行的区间数，稳定行共享存储不改变该字段含义。
+    #[cfg(feature = "profile")]
+    fn logical_interval_count(&self) -> usize {
+        self.lines.iter().map(|range| range.end - range.start).sum()
     }
 }
 
@@ -791,56 +825,25 @@ fn build_axis_intervals_from_leaves(
 ) -> Result<(), SparseQuadError> {
     prepare_interval_buckets(row_buckets);
     prepare_interval_buckets(column_buckets);
+    let mut all_lod_zero = true;
     for leaf in leaves {
         push_leaf_axis_intervals_one(leaf, row_buckets, column_buckets)?;
+        all_lod_zero &= leaf.lod == 0;
     }
 
-    build_axis_intervals_from_buckets(row_buckets, rows, true)?;
-    build_axis_intervals_from_buckets(column_buckets, columns, false)
+    if all_lod_zero {
+        build_unit_axis_intervals_from_buckets(row_buckets, rows)?;
+        build_unit_axis_intervals_from_buckets(column_buckets, columns)
+    } else {
+        build_axis_intervals_from_buckets(row_buckets, rows, true)?;
+        build_axis_intervals_from_buckets(column_buckets, columns, false)
+    }
 }
 
 fn prepare_interval_buckets(buckets: &mut [IntervalBucket; EDGE]) {
     for bucket in buckets {
-        bucket.len = 0;
+        bucket.starts = 0;
     }
-}
-
-fn push_leaf_line_intervals(
-    leaf: QuadLeaf64,
-    row_intervals: &mut Vec<LineInterval>,
-    column_intervals: &mut Vec<LineInterval>,
-) -> Result<(), SparseQuadError> {
-    let size = validate_leaf_shape(leaf)?;
-    let u1 = leaf.u + size;
-    let v1 = leaf.v + size;
-    let value = leaf.value.get();
-
-    allocate_more(row_intervals, usize::from(size))?;
-    let row_interval = Interval {
-        start: leaf.u,
-        end: u1,
-        value,
-    };
-    for line in leaf.v..v1 {
-        row_intervals.push(LineInterval {
-            line,
-            interval: row_interval,
-        });
-    }
-
-    allocate_more(column_intervals, usize::from(size))?;
-    let column_interval = Interval {
-        start: leaf.v,
-        end: v1,
-        value,
-    };
-    for line in leaf.u..u1 {
-        column_intervals.push(LineInterval {
-            line,
-            interval: column_interval,
-        });
-    }
-    Ok(())
 }
 
 fn push_leaf_axis_intervals_one(
@@ -858,86 +861,108 @@ fn push_leaf_axis_intervals_one(
         end: u1,
         value,
     };
-    for row in leaf.v..v1 {
-        let Some(bucket) = row_buckets.get_mut(usize::from(row)) else {
-            return Err(SparseQuadError::CapacityOverflow);
-        };
-        bucket.try_push(row_interval)?;
-    }
+    let Some(row_bucket) = row_buckets.get_mut(usize::from(leaf.v)) else {
+        return Err(SparseQuadError::CapacityOverflow);
+    };
+    row_bucket.try_push(row_interval)?;
 
     let column_interval = Interval {
         start: leaf.v,
         end: v1,
         value,
     };
-    for column in leaf.u..u1 {
-        let Some(bucket) = column_buckets.get_mut(usize::from(column)) else {
-            return Err(SparseQuadError::CapacityOverflow);
-        };
-        bucket.try_push(column_interval)?;
-    }
+    let Some(column_bucket) = column_buckets.get_mut(usize::from(leaf.u)) else {
+        return Err(SparseQuadError::CapacityOverflow);
+    };
+    column_bucket.try_push(column_interval)?;
     Ok(())
 }
 
 // 轴区间构建
 
-fn build_axis_intervals_from_line_intervals(
-    line_intervals: &mut [LineInterval],
+fn build_unit_axis_intervals_from_buckets(
+    buckets: &[IntervalBucket; EDGE],
     output: &mut AxisIntervals,
-    validate_overlap: bool,
 ) -> Result<(), SparseQuadError> {
-    line_intervals.sort_unstable_by_key(|item| (item.line, item.interval.start));
     output.clear_for_build()?;
-
-    let mut cursor = 0usize;
-    for line in 0..EDGE {
-        let line_coord = u8::try_from(line).map_err(|_| SparseQuadError::CapacityOverflow)?;
+    let mut previous = LineRange::default();
+    for (line, bucket) in buckets.iter().enumerate() {
         let start = output.intervals.len();
-        let mut previous_end = None::<u8>;
-        while let Some(item) = line_intervals
-            .get(cursor)
-            .copied()
-            .filter(|item| item.line == line_coord)
-        {
-            if validate_overlap && previous_end.is_some_and(|end| end > item.interval.start) {
-                return Err(SparseQuadError::Overlap);
-            }
-            previous_end = Some(item.interval.end);
-            push_merged_interval(&mut output.intervals, start, item.interval)?;
-            cursor += 1;
+        let mut starts = bucket.starts;
+        reserve_exact(&output.intervals, starts.count_ones() as usize)?;
+        while starts != 0 {
+            let interval = *get(&bucket.items, starts.trailing_zeros() as usize);
+            // 单位区间起点互异即不重叠；重复起点已在事件入桶时报告。
+            push_merged_interval(&mut output.intervals, start, interval)?;
+            starts &= starts - 1;
         }
         let end = output.intervals.len();
+        let range = if end - start == previous.end - previous.start
+            && slice(&output.intervals, start..end)
+                == slice(&output.intervals, previous.start..previous.end)
+        {
+            output.intervals.resize(start, EMPTY_INTERVAL);
+            previous
+        } else {
+            output.boundaries |= 1u64 << line;
+            LineRange { start, end }
+        };
         let Some(slot) = output.lines.get_mut(line) else {
             return Err(SparseQuadError::CapacityOverflow);
         };
-        *slot = LineRange { start, end };
+        *slot = range;
+        previous = range;
     }
     Ok(())
 }
 
 fn build_axis_intervals_from_buckets(
-    buckets: &mut [IntervalBucket; EDGE],
+    buckets: &[IntervalBucket; EDGE],
     output: &mut AxisIntervals,
     validate_overlap: bool,
 ) -> Result<(), SparseQuadError> {
     output.clear_for_build()?;
-    for (line, bucket) in buckets.iter_mut().enumerate() {
-        let bucket = slice_mut(&mut bucket.items, 0..usize::from(bucket.len));
-        bucket.sort_unstable_by_key(|interval| interval.start);
-        if validate_overlap {
-            validate_non_overlapping_line(bucket)?;
+    let mut active = IntervalBucket::new();
+    let mut end_masks = [0u64; EDGE];
+    let mut range = LineRange::default();
+    for (line, bucket) in buckets.iter().enumerate() {
+        let expired = *get(&end_masks, line);
+        if bucket.starts | expired != 0 {
+            output.boundaries |= 1u64 << line;
+            active.starts &= !expired;
+            let mut starts = bucket.starts;
+            while starts != 0 {
+                let interval = *get(&bucket.items, starts.trailing_zeros() as usize);
+                active.try_push(interval)?;
+                // square 的轴区间长度也等于沿扫描方向存活的行数。
+                let end_line = line + usize::from(interval.end - interval.start);
+                if end_line < EDGE {
+                    *crate::get_mut(&mut end_masks, end_line) |= 1u64 << interval.start;
+                }
+                starts &= starts - 1;
+            }
+            let start = output.intervals.len();
+            let mut active_starts = active.starts;
+            reserve_exact(&output.intervals, active_starts.count_ones() as usize)?;
+            let mut previous_end = 0u8;
+            while active_starts != 0 {
+                let interval = *get(&active.items, active_starts.trailing_zeros() as usize);
+                if validate_overlap && previous_end > interval.start {
+                    return Err(SparseQuadError::Overlap);
+                }
+                previous_end = interval.end;
+                push_merged_interval(&mut output.intervals, start, interval)?;
+                active_starts &= active_starts - 1;
+            }
+            range = LineRange {
+                start,
+                end: output.intervals.len(),
+            };
         }
-
-        let start = output.intervals.len();
-        reserve_exact(&output.intervals, bucket.len())?;
-        for &interval in bucket.iter() {
-            push_merged_interval(&mut output.intervals, start, interval)?;
-        }
-        let end = output.intervals.len();
         let Some(slot) = output.lines.get_mut(line) else {
             return Err(SparseQuadError::CapacityOverflow);
         };
-        *slot = LineRange { start, end };
+        *slot = range;
     }
     Ok(())
 }
@@ -958,17 +983,6 @@ fn push_merged_interval(
     }
     reserve_one(output)?;
     output.push(interval);
-    Ok(())
-}
-
-fn validate_non_overlapping_line(intervals: &[Interval]) -> Result<(), SparseQuadError> {
-    let mut previous_end = None::<u8>;
-    for interval in intervals {
-        if previous_end.is_some_and(|end| end > interval.start) {
-            return Err(SparseQuadError::Overlap);
-        }
-        previous_end = Some(interval.end);
-    }
     Ok(())
 }
 
@@ -1044,6 +1058,9 @@ fn extract_sparse_chords(
 ) -> Result<(), SparseQuadError> {
     groups.clear();
     for y in 1u8..EDGE_U8 {
+        if rows.boundaries & (1u64 << y) == 0 {
+            continue;
+        }
         emit_horizontal_chords_for_boundary(
             rows.line(usize::from(y - 1)),
             rows.line(usize::from(y)),
@@ -1052,6 +1069,9 @@ fn extract_sparse_chords(
         )?;
     }
     for x in 1u8..EDGE_U8 {
+        if columns.boundaries & (1u64 << x) == 0 {
+            continue;
+        }
         emit_vertical_chords_for_boundary(
             columns.line(usize::from(x - 1)),
             columns.line(usize::from(x)),
@@ -1155,21 +1175,36 @@ fn build_cut_masks(
     vertical_cuts: &[VerticalCut],
     horizontal_masks: &mut FixedVec<u64, EDGE>,
     vertical_masks: &mut FixedVec<u128, EDGE>,
-) -> Result<(), SparseQuadError> {
+) -> Result<u64, SparseQuadError> {
     // 位图用 OR 合并，切线顺序无关；无需在收集后排序。
     horizontal_masks.clear();
     horizontal_masks.resize(EDGE, 0);
     vertical_masks.clear();
     vertical_masks.resize(EDGE, 0);
 
+    let mut boundaries = 0u64;
+
     for cut in vertical_cuts {
-        let bit = 1u128 << u32::from(cut.x);
-        for y in cut.start..cut.end {
-            let Some(mask) = vertical_masks.get_mut(usize::from(y)) else {
-                return Err(SparseQuadError::CapacityOverflow);
-            };
-            *mask |= bit;
+        if cut.start >= cut.end {
+            continue;
         }
+        let bit = 1u128 << u32::from(cut.x);
+        let Some(start_mask) = vertical_masks.get_mut(usize::from(cut.start)) else {
+            return Err(SparseQuadError::CapacityOverflow);
+        };
+        *start_mask ^= bit;
+        boundaries |= 1u64 << cut.start;
+        if cut.end < EDGE_U8 {
+            *crate::get_mut(vertical_masks, usize::from(cut.end)) ^= bit;
+            boundaries |= 1u64 << cut.end;
+        }
+    }
+    // 同向 chord 在相同 x 上连端点都互不重叠，因此每个 x 的覆盖数仅为 0/1。
+    // 起止端点 XOR 后做前缀即可重建 OR 覆盖；end=64 在最终关闭时隐式处理。
+    let mut active = 0u128;
+    for mask in vertical_masks.iter_mut() {
+        active ^= *mask;
+        *mask = active;
     }
 
     for cut in horizontal_cuts {
@@ -1177,9 +1212,10 @@ fn build_cut_masks(
             return Err(SparseQuadError::CapacityOverflow);
         };
         *mask |= cell_range_mask(cut.start, cut.end);
+        boundaries |= 1u64 << cut.y;
     }
 
-    Ok(())
+    Ok(boundaries)
 }
 
 fn build_runs_for_row(
@@ -1465,6 +1501,10 @@ mod tests {
                 y: RangeU8::new(0, EDGE_U8),
             }],
         );
+        assert_eq!(scratch.rows.intervals.len(), 1);
+        assert_eq!(scratch.columns.intervals.len(), 1);
+        assert_eq!(scratch.rows.boundaries, 1);
+        assert_eq!(scratch.columns.boundaries, 1);
     }
 
     #[test]
@@ -1482,6 +1522,360 @@ mod tests {
         let mut scratch = SparseOptimalScratch64::new();
         let _ = ok(scratch.decompose_borrowed(&[leaf(0, 0, ROOT_LOD, NonZeroU16::MIN)]));
         assert!(matches!(scratch.decompose_borrowed(&[]), Ok([])));
+    }
+
+    #[test]
+    fn shuffled_mixed_lod_leaves_keep_optimum_and_exact_coverage() {
+        // label 1 的 (63, 0) 与 (0, 63) 不能由同一矩形覆盖，故至少需要两个。
+        // 上半区与左下区恰好给出两个矩形，右下两个色带各一个，独立最优值为 4。
+        let leaves = [
+            leaf(0, 0, 5, nz(1)),
+            leaf(32, 0, 4, nz(1)),
+            leaf(48, 0, 3, nz(1)),
+            leaf(56, 0, 3, nz(1)),
+            leaf(48, 8, 3, nz(1)),
+            leaf(56, 8, 3, nz(1)),
+            leaf(32, 16, 4, nz(1)),
+            leaf(48, 16, 4, nz(1)),
+            leaf(0, 32, 5, nz(1)),
+            leaf(32, 32, 4, nz(2)),
+            leaf(48, 32, 4, nz(2)),
+            leaf(32, 48, 4, nz(3)),
+            leaf(48, 48, 4, nz(3)),
+        ];
+        let mut expected = [[0u16; EDGE]; EDGE];
+        for item in leaves {
+            let size = quad_size(item.lod);
+            for y in item.v..item.v + size {
+                for x in item.u..item.u + size {
+                    *get_mut(get_mut(&mut expected, usize::from(y)), usize::from(x)) =
+                        item.value.get();
+                }
+            }
+        }
+
+        let mut scratch = SparseOptimalScratch64::new();
+        let Some(canonical) = ok(scratch.decompose(&leaves)) else {
+            return;
+        };
+        assert_eq!(canonical.len(), 4);
+        for shift in 0..leaves.len() {
+            for reverse in [false, true] {
+                let mut shuffled = leaves;
+                shuffled.rotate_left(shift);
+                if reverse {
+                    shuffled.reverse();
+                }
+                let Some(rectangles) = ok(scratch.decompose_borrowed(&shuffled)) else {
+                    return;
+                };
+                assert_eq!(rectangles, canonical.as_slice());
+                let mut actual = [[0u16; EDGE]; EDGE];
+                for rectangle in rectangles {
+                    for y in rectangle.y.start..rectangle.y.end {
+                        for x in rectangle.x.start..rectangle.x.end {
+                            let pixel =
+                                get_mut(get_mut(&mut actual, usize::from(y)), usize::from(x));
+                            assert_eq!(*pixel, 0, "矩形不得重叠");
+                            *pixel = rectangle.value;
+                        }
+                    }
+                }
+                assert_eq!(actual, expected);
+            }
+        }
+    }
+
+    #[test]
+    fn last_coordinate_slot_reuses_scratch_after_failed_builds() {
+        let mut scratch = SparseOptimalScratch64::new();
+        let overlapping_pairs = [
+            // 起点不同的包含关系必须由有序区间的 end 检查识别。
+            [leaf(0, 0, 2, nz(1)), leaf(2, 2, 1, nz(2))],
+            // 起点重复直接由占用位图识别。
+            [leaf(0, 0, 1, nz(1)), leaf(0, 0, 0, nz(2))],
+        ];
+        for [first, second] in overlapping_pairs {
+            for input in [[first, second], [second, first]] {
+                assert_eq!(
+                    scratch.decompose_borrowed(&input),
+                    Err(SparseQuadError::Overlap)
+                );
+                let Some(rectangles) =
+                    ok(scratch.decompose_borrowed(&[leaf(63, 63, 0, NonZeroU16::MAX)]))
+                else {
+                    return;
+                };
+                assert_eq!(
+                    rectangles,
+                    &[Rectangle {
+                        value: u16::MAX,
+                        x: RangeU8::new(63, 64),
+                        y: RangeU8::new(63, 64),
+                    }],
+                );
+                assert_eq!(scratch.decompose_borrowed(&[]), Ok([].as_slice()));
+            }
+        }
+    }
+
+    #[test]
+    fn morton_key_sort_matches_comparison_order_for_every_pixel_key() {
+        assert_eq!(std::mem::size_of::<StoredLeaf>(), 8);
+        let leaves: Vec<_> = (0..MAX_AXIS_INTERVALS)
+            .map(|index| {
+                let shuffled = (index * 4051) % MAX_AXIS_INTERVALS;
+                leaf(
+                    u8::try_from(shuffled % EDGE).unwrap_or_default(),
+                    u8::try_from(shuffled / EDGE).unwrap_or_default(),
+                    0,
+                    NonZeroU16::MIN,
+                )
+            })
+            .collect();
+        let Some(image) = ok(SparseQuadImage64::from_leaves(&leaves)) else {
+            return;
+        };
+        let mut expected = Vec::new();
+        for item in leaves {
+            let Some(stored) = ok(validate_leaf(item)) else {
+                return;
+            };
+            expected.push(stored);
+        }
+        expected.sort_unstable_by_key(|stored| stored.morton_start);
+        assert_eq!(image.leaves, expected);
+        let ordered_leaves: Vec<_> = expected.iter().map(|stored| stored.leaf).collect();
+        let Some(ordered_image) = ok(SparseQuadImage64::from_leaves(&ordered_leaves)) else {
+            return;
+        };
+        assert_eq!(ordered_image.leaves, expected);
+    }
+
+    #[test]
+    fn morton_key_sort_keeps_threshold_overlap_and_shape_error_semantics() {
+        for count in [63usize, 64, 65, 512] {
+            let mut leaves: Vec<_> = (0..count)
+                .map(|index| {
+                    leaf(
+                        u8::try_from(index % EDGE).unwrap_or_default(),
+                        u8::try_from(index / EDGE).unwrap_or_default(),
+                        0,
+                        NonZeroU16::MIN,
+                    )
+                })
+                .collect();
+            leaves.reverse();
+            let Some(image) = ok(SparseQuadImage64::from_leaves(&leaves)) else {
+                return;
+            };
+            assert!(
+                image
+                    .leaves
+                    .windows(2)
+                    .all(|pair| { get(pair, 0).morton_start < get(pair, 1).morton_start })
+            );
+            leaves.push(*get(&leaves, 0));
+            assert_from_leaves_error(&leaves, SparseQuadError::Overlap);
+        }
+        let mut overfull = vec![leaf(0, 0, 0, NonZeroU16::MIN); MAX_AXIS_INTERVALS + 1];
+        // 首键大于下一键，确保经过大输入置换入口的容量检查。
+        *get_mut(&mut overfull, 0) = leaf(63, 63, 0, NonZeroU16::MIN);
+        assert_from_leaves_error(&overfull, SparseQuadError::Overlap);
+        *get_mut(&mut overfull, MAX_AXIS_INTERVALS) = leaf(0, 0, 7, NonZeroU16::MIN);
+        assert_from_leaves_error(&overfull, SparseQuadError::LodOutOfRange);
+    }
+
+    #[test]
+    fn axis_events_share_stable_rows_and_handle_end_64() {
+        let mut scratch = SparseOptimalScratch64::new();
+        let Some(full_rectangles) =
+            ok(scratch.decompose_borrowed(&[leaf(0, 0, 6, NonZeroU16::MIN)]))
+        else {
+            return;
+        };
+        assert_eq!(full_rectangles.len(), 1);
+        assert_eq!(scratch.rows.intervals.len(), 1);
+        assert_eq!(scratch.columns.intervals.len(), 1);
+        assert_eq!(scratch.rows.boundaries, 1);
+        assert_eq!(scratch.columns.boundaries, 1);
+        for line in 0..EDGE {
+            assert_eq!(get(&scratch.rows.lines, line), get(&scratch.rows.lines, 0));
+            assert_eq!(
+                get(&scratch.columns.lines, line),
+                get(&scratch.columns.lines, 0)
+            );
+        }
+
+        let Some(band_rectangles) = ok(scratch.decompose_borrowed(&[leaf(16, 32, 4, nz(9))]))
+        else {
+            return;
+        };
+        assert_eq!(
+            band_rectangles,
+            &[Rectangle {
+                value: 9,
+                x: RangeU8::new(16, 32),
+                y: RangeU8::new(32, 48),
+            }]
+        );
+        assert_eq!(scratch.rows.intervals.len(), 1);
+        assert_eq!(scratch.columns.intervals.len(), 1);
+        assert_eq!(scratch.rows.boundaries, (1u64 << 32) | (1u64 << 48));
+        assert_eq!(scratch.columns.boundaries, (1u64 << 16) | (1u64 << 32));
+        #[cfg(feature = "profile")]
+        {
+            let Some(profile) = ok(scratch.decompose_profile(&[leaf(0, 0, 6, NonZeroU16::MIN)]))
+            else {
+                return;
+            };
+            assert_eq!(profile.counts.row_intervals, EDGE);
+            assert_eq!(profile.counts.column_intervals, EDGE);
+        }
+    }
+
+    #[test]
+    fn builder_reuses_leaf_events_after_clear_and_repeated_finish() {
+        let mut builder = SparseLayerBuilder64::new();
+        let mut scratch = SparseOptimalScratch64::new();
+        for item in [leaf(0, 0, 4, nz(1)), leaf(0, 16, 4, nz(2))] {
+            let _ = ok(builder.push_square(item.u, item.v, item.lod, item.value));
+        }
+        let Some(first) = ok(builder.finish(&mut scratch)) else {
+            return;
+        };
+        assert_eq!(first.len(), 2);
+        assert_eq!(builder.finish(&mut scratch), Ok(first));
+        builder.clear();
+        assert_eq!(builder.finish(&mut scratch), Ok(Vec::new()));
+        let _ = ok(builder.push_square(32, 32, 5, nz(3)));
+        assert_eq!(
+            builder.finish(&mut scratch),
+            Ok(vec![Rectangle {
+                value: 3,
+                x: RangeU8::new(32, 64),
+                y: RangeU8::new(32, 64),
+            }])
+        );
+    }
+
+    #[test]
+    fn endpoint_cut_masks_match_cell_coverage_with_adjacent_segments() {
+        let vertical = [
+            VerticalCut {
+                x: 1,
+                start: 0,
+                end: 32,
+            },
+            VerticalCut {
+                x: 1,
+                start: 32,
+                end: 64,
+            },
+            VerticalCut {
+                x: 63,
+                start: 1,
+                end: 64,
+            },
+        ];
+        let horizontal = [HorizontalCut {
+            y: 63,
+            start: 0,
+            end: 64,
+        }];
+        let mut horizontal_masks = FixedVec::new(0u64);
+        let mut vertical_masks = FixedVec::new(0u128);
+        let Some(boundaries) = ok(build_cut_masks(
+            &horizontal,
+            &vertical,
+            &mut horizontal_masks,
+            &mut vertical_masks,
+        )) else {
+            return;
+        };
+        let mut expected = [0u128; EDGE];
+        for cut in vertical {
+            for y in cut.start..cut.end {
+                *get_mut(&mut expected, usize::from(y)) |= 1u128 << cut.x;
+            }
+        }
+        assert_eq!(vertical_masks.as_slice(), expected.as_slice());
+        assert_eq!(*get(&horizontal_masks, 63), u64::MAX);
+        assert_eq!(boundaries, 1 | (1u64 << 1) | (1u64 << 32) | (1u64 << 63));
+    }
+
+    #[test]
+    fn serrated_border_pixels_produce_a_dense_valid_chord_graph() {
+        let mut leaves = Vec::new();
+        for y in 0..EDGE_U8 {
+            for x in 0..EDGE_U8 {
+                let vertical_border = x == 0 || x == EDGE_U8 - 1;
+                let horizontal_border = y == 0 || y == EDGE_U8 - 1;
+                let occupied = match (vertical_border, horizontal_border) {
+                    (true, true) => false,
+                    (true, false) => y % 2 == 1,
+                    (false, true) => x % 2 == 1,
+                    (false, false) => true,
+                };
+                if occupied {
+                    leaves.push(leaf(x, y, 0, NonZeroU16::MIN));
+                }
+            }
+        }
+        let mut scratch = SparseOptimalScratch64::new();
+        let Some(rectangles) = ok(scratch.decompose_borrowed(&leaves)) else {
+            return;
+        };
+        assert_eq!(rectangles.len(), 124);
+        let horizontal = &scratch.chord_groups.horizontal;
+        let vertical = &scratch.chord_groups.vertical;
+        assert_eq!(horizontal.len(), 122);
+        assert_eq!(vertical.len(), 122);
+        for chords in [horizontal, vertical] {
+            let long_chords = chords
+                .iter()
+                .filter(|item| {
+                    let chord = item.chord;
+                    (chord.orientation == Orientation::Horizontal
+                        && chord.x1 == 1
+                        && chord.x2 == 63)
+                        || (chord.orientation == Orientation::Vertical
+                            && chord.y1 == 1
+                            && chord.y2 == 63)
+                })
+                .count();
+            assert_eq!(long_chords, 61);
+        }
+        let (graph, _) = crate::graph::build_sparse_conflict_graph_csr(
+            horizontal,
+            vertical,
+            &mut scratch.matching.conflict,
+        );
+        assert_eq!(graph.edges.len(), 3964);
+        for (left, horizontal_item) in horizontal.iter().enumerate() {
+            let h = horizontal_item.chord;
+            let expected: Vec<_> = vertical
+                .iter()
+                .enumerate()
+                .filter_map(|(right, vertical_item)| {
+                    let v = vertical_item.chord;
+                    ((h.x1..=h.x2).contains(&v.x1) && (v.y1..=v.y2).contains(&h.y1))
+                        .then(|| crate::u16_index(right))
+                })
+                .collect();
+            let mut actual = graph.neighbors(left).to_vec();
+            actual.sort_unstable();
+            assert_eq!(actual, expected);
+        }
+        #[cfg(feature = "profile")]
+        {
+            let Some(profile) = ok(scratch.decompose_profile(&leaves)) else {
+                return;
+            };
+            assert_eq!(profile.counts.greedy_matches, 122);
+            assert_eq!(profile.counts.matching_phases, 0);
+            assert_eq!(profile.counts.matching_augmentations, 0);
+        }
     }
 
     #[test]

@@ -14,7 +14,6 @@ use crate::{copy, slice};
 
 pub const IMAGE64_AXIS_LIMIT: usize = 64;
 pub const IMAGE64_AXIS_LEN: usize = IMAGE64_AXIS_LIMIT + 1;
-pub const IMAGE64_GRID_POINTS: usize = IMAGE64_AXIS_LEN * IMAGE64_AXIS_LEN;
 pub const IMAGE64_MAX_CONFLICT_EDGES: usize = (IMAGE64_AXIS_LIMIT - 1) * (IMAGE64_AXIS_LIMIT - 1);
 /// 每条内部格线至多有 floor(63 / 2) 条端点互异的同向 chord。
 pub const IMAGE64_MAX_CHORDS: usize = (IMAGE64_AXIS_LIMIT - 1) * ((IMAGE64_AXIS_LIMIT - 1) / 2);
@@ -68,7 +67,8 @@ pub struct SparseAdjacencyRef<'a> {
 
 #[derive(Clone, Debug)]
 pub struct ConflictFinalizeScratch {
-    /// 前半段为右顶点的边段起点，后半段为按 (度数, 编号) 排序的右顶点。
+    /// 构图时暂存横向起止事件的 next 和纵向查询的 next；CSR 阶段复用为
+    /// 右顶点的边段起点及按 (度数, 编号) 排序的右顶点。
     pub(super) right_layout: FixedVec<u32, { 2 * IMAGE64_MAX_CHORDS }>,
     pub(super) next_offsets: ChordBuffer<usize>,
     pub(super) edge_buffer: [SparseEdge; IMAGE64_MAX_CONFLICT_EDGES],
@@ -76,11 +76,11 @@ pub struct ConflictFinalizeScratch {
     pub(super) right_degrees: ChordBuffer<u8>,
     pub(super) adjacency_offsets: FixedVec<usize, { IMAGE64_MAX_CHORDS + 1 }>,
     pub(super) adjacency_edges: FixedVec<u16, IMAGE64_MAX_CONFLICT_EDGES>,
-    pub(super) horizontal_grid: [u16; IMAGE64_GRID_POINTS],
-    /// 配合列标记表示本轮已写入的格点，无需再为每个格点保存一份标记。
-    pub(super) horizontal_y_masks: [u64; IMAGE64_AXIS_LEN],
-    pub(super) horizontal_x_marks: [u16; IMAGE64_AXIS_LEN],
-    pub(super) grid_mark: u16,
+    pub(super) horizontal_start_heads: [u16; IMAGE64_AXIS_LEN],
+    pub(super) horizontal_end_heads: [u16; IMAGE64_AXIS_LEN],
+    pub(super) vertical_query_heads: [u16; IMAGE64_AXIS_LEN],
+    /// 活跃 y 位由扫线的局部 u64 保存，只读取活跃行的水平 chord 编号。
+    pub(super) active_horizontal: [u16; IMAGE64_AXIS_LEN],
 }
 
 impl Default for ConflictFinalizeScratch {
@@ -99,12 +99,12 @@ impl ConflictFinalizeScratch {
             right_degrees: FixedVec::new(0),
             adjacency_offsets: FixedVec::new(0),
             adjacency_edges: FixedVec::new(0),
-            // 仅通过本轮标记和位图读取已写入的槽；初值无需 UNMATCHED。
+            // 事件头在每轮构图时重置；仅通过活跃位读取 owner。
             // 全零初值使整个栈 scratch 可由一次 memset 初始化。
-            horizontal_grid: [0; IMAGE64_GRID_POINTS],
-            horizontal_y_masks: [0; IMAGE64_AXIS_LEN],
-            horizontal_x_marks: [0; IMAGE64_AXIS_LEN],
-            grid_mark: 0,
+            horizontal_start_heads: [0; IMAGE64_AXIS_LEN],
+            horizontal_end_heads: [0; IMAGE64_AXIS_LEN],
+            vertical_query_heads: [0; IMAGE64_AXIS_LEN],
+            active_horizontal: [0; IMAGE64_AXIS_LEN],
         }
     }
 }
@@ -129,6 +129,7 @@ pub struct HkScratch {
     pub(super) reachable_right: ChordBuffer<bool>,
     pub(super) transpose_offsets: FixedVec<usize, { IMAGE64_MAX_CHORDS + 1 }>,
     pub(super) transpose_edges: FixedVec<u16, IMAGE64_MAX_CONFLICT_EDGES>,
+    /// 转置 CSR 写入游标；构造完成后复用为长度 3 增广的左邻接扫描游标。
     pub(super) write_offsets: ChordBuffer<usize>,
     pub(super) right_order: ChordBuffer<u16>,
     pub(super) right_degree_counts: FixedVec<usize, IMAGE64_AXIS_LIMIT>,
