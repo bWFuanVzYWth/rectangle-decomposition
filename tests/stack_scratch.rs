@@ -106,7 +106,7 @@ fn construction_and_reused_borrowed_output_do_not_allocate() -> Result<(), Spars
             assert!(output_start >= scratch_start);
             assert!(output_end <= scratch_start + std::mem::size_of_val(&scratch));
         }
-        assert!(scratch.decompose_borrowed(&[])?.is_empty());
+        assert_eq!(scratch.decompose_borrowed(&[])?, []);
     }
     finish_tracking();
     Ok(())
@@ -157,7 +157,7 @@ fn compatibility_constructor_does_not_allocate() -> Result<(), SparseQuadError> 
             return Err(SparseQuadError::AllocationFailed);
         };
         scratch.preallocate_64()?;
-        assert!(scratch.decompose_borrowed(&[])?.is_empty());
+        assert_eq!(scratch.decompose_borrowed(&[])?, []);
     }
     finish_tracking();
     Ok(())
@@ -168,7 +168,7 @@ fn default_constructor_does_not_allocate() -> Result<(), SparseQuadError> {
     start_tracking();
     {
         let mut scratch = SparseOptimalScratch64::default();
-        assert!(scratch.decompose_borrowed(&[])?.is_empty());
+        assert_eq!(scratch.decompose_borrowed(&[])?, []);
     }
     finish_tracking();
     Ok(())

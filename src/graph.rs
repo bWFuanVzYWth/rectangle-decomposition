@@ -293,6 +293,6 @@ mod tests {
         scratch.right_degrees.clear();
         let (empty, _) = build_sparse_adjacency_in_scratch(0, 0, scratch);
         assert_eq!(empty.offsets, &[0]);
-        assert!(empty.edges.is_empty());
+        assert_eq!(empty.edges, []);
     }
 }

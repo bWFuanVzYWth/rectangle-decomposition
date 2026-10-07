@@ -29,7 +29,7 @@ pub fn hopcroft_karp_dw_sparse_csr_u16(
         };
         augment_phase(adjacency, scratch, shortest_depth);
     }
-    collect_reachable(adjacency, scratch);
+    collect_independent_set_marks(scratch);
 }
 
 #[cfg(feature = "profile")]
@@ -68,7 +68,7 @@ pub fn hopcroft_karp_dw_sparse_csr_u16_profile(
         timings.dfs_search += dfs_start.elapsed();
     }
     let cover_start = Instant::now();
-    collect_reachable(adjacency, scratch);
+    collect_independent_set_marks(scratch);
     timings.cover = cover_start.elapsed();
     timings.total = total_start.elapsed();
     (timings, counts)
@@ -244,34 +244,30 @@ fn dfs(
     false
 }
 
-/// 反向 BFS 的标记不能直接用于原有独立集公式；从空闲左顶点重新求可达性。
-fn collect_reachable(adjacency: &SparseAdjacencyRef<'_>, scratch: &mut HkScratch) {
-    scratch.reachable_left.fill(false);
-    scratch.reachable_right.fill(false);
-    scratch.queue.clear();
-    for (left, &matched) in scratch.pair_left.iter().enumerate() {
-        if matched == UNMATCHED_U16 {
-            *get_mut(&mut scratch.reachable_left, left) = true;
-            scratch.queue.push(u16_index(left));
-        }
+/// 将最终反向 BFS 的对偶覆盖编码为左侧选中、右侧排除标记。
+///
+/// 若左侧已全部匹配，右侧全体就是最大独立集，不能读取成功 BFS 的旧层次。
+/// 否则最后一次 BFS 必须失败：没有最短深度截断，`right_distance` 恰好记录
+/// 从空闲右顶点出发的完整交替可达集 `Z_R`。此时 `Z_L` 中的每个左顶点均已匹配，
+/// 且其匹配右顶点也在 `Z_R`；反过来也成立。因此最大独立集为 `(L \ Z_L) ∪ Z_R`。
+/// 保留调用方现有的布尔编码，避免再从空闲左顶点扫描一次冲突边。
+fn collect_independent_set_marks(scratch: &mut HkScratch) {
+    if scratch.unmatched_lefts.is_empty() {
+        scratch.reachable_left.fill(false);
+        scratch.reachable_right.fill(false);
+        return;
     }
-    let mut head = 0usize;
-    while head < scratch.queue.len() {
-        let left = usize::from(copy(&scratch.queue, head));
-        head += 1;
-        for &right in adjacency.neighbors(left) {
-            if copy(&scratch.pair_left, left) == right {
-                continue;
-            }
-            let right = usize::from(right);
-            *get_mut(&mut scratch.reachable_right, right) = true;
-            let matched = copy(&scratch.pair_right, right);
-            debug_assert_ne!(matched, UNMATCHED_U16, "存在未处理的增广路径");
-            if matched != UNMATCHED_U16 && !copy(&scratch.reachable_left, usize::from(matched)) {
-                *get_mut(&mut scratch.reachable_left, usize::from(matched)) = true;
-                scratch.queue.push(matched);
-            }
-        }
+
+    for (excluded, &distance) in scratch
+        .reachable_right
+        .iter_mut()
+        .zip(&scratch.right_distance)
+    {
+        *excluded = distance == u16::MAX;
+    }
+    for (selected, &matched) in scratch.reachable_left.iter_mut().zip(&scratch.pair_left) {
+        *selected = matched == UNMATCHED_U16
+            || copy(&scratch.right_distance, usize::from(matched)) == u16::MAX;
     }
 }
 
@@ -418,7 +414,7 @@ mod tests {
                 assert_eq!(augmentations, 2);
             }
             assert_eq!(scratch.pair_left.as_slice(), &[0, 1, 2, 3, 4]);
-            collect_reachable(&adjacency, &mut scratch);
+            collect_independent_set_marks(&mut scratch);
             assert_eq!(assert_optimal_certificate(&adjacency, &scratch), 5);
         }
     }
@@ -452,7 +448,7 @@ mod tests {
         initialize_search(scratch);
         assert_eq!(build_reverse_levels(scratch), Some(u16_index(size - 1)));
         assert_eq!(augment_phase(&adjacency, scratch, u16_index(size - 1)), 1);
-        collect_reachable(&adjacency, scratch);
+        collect_independent_set_marks(scratch);
         assert_eq!(assert_optimal_certificate(&adjacency, scratch), size);
         assert_eq!(scratch.dfs_stack.capacity(), stack_capacity);
     }
@@ -473,8 +469,60 @@ mod tests {
         assert_eq!(scratch.shortest_roots.len(), 63 * 63);
         assert_eq!(scratch.shortest_roots.capacity(), roots_capacity);
         assert_eq!(augment_phase(&adjacency, scratch, 0), 63);
-        collect_reachable(&adjacency, scratch);
+        collect_independent_set_marks(scratch);
         assert_eq!(assert_optimal_certificate(&adjacency, scratch), 63);
+    }
+
+    #[test]
+    fn saturated_left_ignores_stale_reverse_levels() {
+        let graph = Graph::new(&[vec![0, 1], vec![1, 2], vec![2, 3]], 5);
+        let adjacency = graph.adjacency();
+        let mut scratch = HkScratch::default();
+        initialize_matching(&adjacency, 5, &graph.degrees, &mut scratch);
+        scratch.pair_left.copy_from_slice(&[0, 1, 2]);
+        scratch
+            .pair_right
+            .copy_from_slice(&[0, 1, 2, UNMATCHED_U16, UNMATCHED_U16]);
+        initialize_search(&mut scratch);
+        // 成功轮的层次可以仍包含任意已匹配右顶点，不能当作最终可达集。
+        scratch.right_distance.fill(0);
+        collect_independent_set_marks(&mut scratch);
+        assert!(scratch.reachable_left.iter().all(|&selected| !selected));
+        assert!(scratch.reachable_right.iter().all(|&excluded| !excluded));
+        assert_eq!(assert_optimal_certificate(&adjacency, &scratch), 3);
+    }
+
+    #[test]
+    fn failed_reverse_bfs_keeps_full_reachability_and_isolated_vertices() {
+        let graph = Graph::new(
+            &[vec![0], vec![0], vec![1, 2], vec![2, 3], vec![3, 4], vec![]],
+            6,
+        );
+        let adjacency = graph.adjacency();
+        let mut scratch = HkScratch::default();
+        initialize_matching(&adjacency, 6, &graph.degrees, &mut scratch);
+        scratch
+            .pair_left
+            .copy_from_slice(&[0, UNMATCHED_U16, 1, 2, 3, UNMATCHED_U16]);
+        scratch
+            .pair_right
+            .copy_from_slice(&[0, 2, 3, 4, UNMATCHED_U16, UNMATCHED_U16]);
+        initialize_search(&mut scratch);
+        assert_eq!(build_reverse_levels(&mut scratch), None);
+        assert_eq!(
+            scratch.right_distance.as_slice(),
+            &[u16::MAX, 3, 2, 1, 0, 0]
+        );
+        collect_independent_set_marks(&mut scratch);
+        assert_eq!(
+            scratch.reachable_left.as_slice(),
+            &[true, true, false, false, false, true]
+        );
+        assert_eq!(
+            scratch.reachable_right.as_slice(),
+            &[true, false, false, false, false, false]
+        );
+        assert_eq!(assert_optimal_certificate(&adjacency, &scratch), 4);
     }
 
     #[test]

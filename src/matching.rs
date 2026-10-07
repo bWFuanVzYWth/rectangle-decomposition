@@ -1,6 +1,6 @@
 //! 稀疏 chord 匹配后端。
 //!
-//! 对每个颜色组的水平/垂直 chord 构建二分冲突图 CSR，再用
+//! 对全部水平/垂直 chord 构建二分冲突图 CSR，再用
 //! Hopcroft-Karp 的 Duff-Wiberg 变体（HKDW）求最大独立集。
 
 #[cfg(feature = "profile")]
@@ -124,7 +124,7 @@ pub struct HkScratch {
     pub(super) unmatched_lefts: ChordBuffer<u16>,
     /// 最短层上的空闲左顶点，可重复；长度至多为冲突边数。
     pub(super) shortest_roots: FixedVec<u16, IMAGE64_MAX_CONFLICT_EDGES>,
-    /// 搜索时复用为本轮访问标记，结束后保存独立集所需的可达性。
+    /// 搜索时保存本轮访问标记，结束后编码左侧选中、右侧排除状态。
     pub(super) reachable_left: ChordBuffer<bool>,
     pub(super) reachable_right: ChordBuffer<bool>,
     pub(super) transpose_offsets: FixedVec<usize, { IMAGE64_MAX_CHORDS + 1 }>,
@@ -231,6 +231,15 @@ impl MatchingScratch {
             vertical_edges,
             &mut self.conflict,
         );
+        if sparse_adjacency.edges.is_empty() {
+            select_full_independent_set(
+                horizontal_edges.len(),
+                vertical_edges.len(),
+                &mut self.selected_horizontal,
+                &mut self.selected_vertical,
+            );
+            return;
+        }
         crate::hk::hopcroft_karp_dw_sparse_csr_u16(
             &sparse_adjacency,
             vertical_edges.len(),
@@ -272,6 +281,23 @@ impl MatchingScratch {
             vertical_edges,
             &mut self.conflict,
         );
+        if sparse_adjacency.edges.is_empty() {
+            let collect_start = Instant::now();
+            select_full_independent_set(
+                horizontal_edges.len(),
+                vertical_edges.len(),
+                &mut self.selected_horizontal,
+                &mut self.selected_vertical,
+            );
+            return MatchingProfile {
+                timings: MatchingTimings {
+                    total: start.elapsed(),
+                    collect: collect_start.elapsed(),
+                    ..MatchingTimings::default()
+                },
+                counts: MatchingCounts::default(),
+            };
+        }
         let (mut timings, counts) = crate::hk::hopcroft_karp_dw_sparse_csr_u16_profile(
             &sparse_adjacency,
             vertical_edges.len(),
@@ -382,6 +408,32 @@ mod tests {
         let selected = scratch.maximum_independent_set(&horizontal, &vertical);
 
         assert_eq!(selected.horizontal.len() + selected.vertical.len(), 4);
+    }
+
+    #[test]
+    fn empty_conflict_graph_selects_both_axes_after_reusing_matched_scratch() {
+        let horizontal = [h(1, 2, 3)];
+        let crossing = [v(2, 1, 3)];
+        let separate = [v(5, 1, 3)];
+        let mut scratch = MatchingScratch::default();
+        for _ in 0..3 {
+            let crossing_selection = scratch.maximum_independent_set(&horizontal, &crossing);
+            assert_eq!(
+                crossing_selection.horizontal.len() + crossing_selection.vertical.len(),
+                1
+            );
+            let separate_selection = scratch.maximum_independent_set(&horizontal, &separate);
+            assert_eq!(separate_selection.horizontal, [0]);
+            assert_eq!(separate_selection.vertical, [0]);
+            #[cfg(feature = "profile")]
+            {
+                let profile = scratch.maximum_independent_set_profile(&horizontal, &separate);
+                assert_eq!(profile.counts.phases, 0);
+                assert_eq!(profile.counts.greedy_matches, 0);
+                assert_eq!(scratch.selected_horizontal(), [0]);
+                assert_eq!(scratch.selected_vertical(), [0]);
+            }
+        }
     }
 
     #[test]

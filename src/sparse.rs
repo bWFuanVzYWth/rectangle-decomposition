@@ -16,8 +16,6 @@ const EDGE: usize = 64;
 const EDGE_U8: u8 = 64;
 const MAX_LOD: u8 = 6;
 const MAX_AXIS_INTERVALS: usize = EDGE * EDGE;
-// 每个有 chord 的颜色至少占 4 个像素；不同颜色不能共享像素。
-const MAX_CHORD_GROUPS: usize = EDGE * EDGE / 4;
 const MAX_RECTANGLES: usize = EDGE * EDGE;
 const EMPTY_INTERVAL: Interval = Interval {
     start: 0,
@@ -26,7 +24,6 @@ const EMPTY_INTERVAL: Interval = Interval {
 };
 const EMPTY_CHORD: ValuedChord = ValuedChord {
     value: 0,
-    order: 0,
     chord: EffectiveChord {
         orientation: Orientation::Horizontal,
         x1: 0,
@@ -184,7 +181,7 @@ pub struct SparseOptimalScratch64 {
     column_buckets: [IntervalBucket; EDGE],
     rows: AxisIntervals,
     columns: AxisIntervals,
-    chord_groups: SparseChordGroups,
+    chord_groups: SparseChords,
     matching: MatchingScratch,
     horizontal_cuts: ChordBuffer<HorizontalCut>,
     vertical_cuts: ChordBuffer<VerticalCut>,
@@ -214,7 +211,7 @@ impl SparseOptimalScratch64 {
                 column_buckets: [const { IntervalBucket::new() }; EDGE],
                 rows: AxisIntervals::new(),
                 columns: AxisIntervals::new(),
-                chord_groups: SparseChordGroups::new(),
+                chord_groups: SparseChords::new(),
                 matching: MatchingScratch::new(),
                 horizontal_cuts: FixedVec::new(HorizontalCut {
                     y: 0,
@@ -326,7 +323,7 @@ impl SparseOptimalScratch64 {
             leaves: leaves.len(),
             row_intervals: self.rows.intervals.len(),
             column_intervals: self.columns.intervals.len(),
-            chord_groups: self.chord_groups.groups.len(),
+            chord_groups: self.chord_groups.logical_group_count(),
             horizontal_chords: self.chord_groups.horizontal.len(),
             vertical_chords: self.chord_groups.vertical.len(),
             ..SparseDecomposeCounts::default()
@@ -422,14 +419,22 @@ impl SparseOptimalScratch64 {
         horizontal_cuts.clear();
         vertical_cuts.clear();
 
+        if groups.horizontal.is_empty() && groups.vertical.is_empty() {
+            return Ok(());
+        }
+
         let horizontal_cap = groups.horizontal.len();
         let vertical_cap = groups.vertical.len();
         reserve_exact(horizontal_cuts, horizontal_cap)?;
         reserve_exact(vertical_cuts, vertical_cap)?;
 
-        for group in &groups.groups {
-            let horizontal = groups.horizontal(group);
-            let vertical = groups.vertical(group);
+        // At every chord grid point at least three adjacent pixels have its
+        // label. Different labels therefore cannot intersect, even at endpoints.
+        // The full graph is the disjoint union of the former per-label graphs.
+        // Matching and independent-set cardinalities add over that union.
+        {
+            let horizontal = groups.horizontal.as_slice();
+            let vertical = groups.vertical.as_slice();
             matching.select_maximum_independent_set(horizontal, vertical);
             for &index in matching.selected_horizontal() {
                 let index = usize::from(index);
@@ -468,15 +473,23 @@ impl SparseOptimalScratch64 {
         horizontal_cuts.clear();
         vertical_cuts.clear();
 
+        if groups.horizontal.is_empty() && groups.vertical.is_empty() {
+            return Ok(SelectCutTimings::default());
+        }
+
         let horizontal_cap = groups.horizontal.len();
         let vertical_cap = groups.vertical.len();
         reserve_exact(horizontal_cuts, horizontal_cap)?;
         reserve_exact(vertical_cuts, vertical_cap)?;
 
         let mut timings = SelectCutTimings::default();
-        for group in &groups.groups {
-            let horizontal = groups.horizontal(group);
-            let vertical = groups.vertical(group);
+        // At every chord grid point at least three adjacent pixels have its
+        // label. Different labels therefore cannot intersect, even at endpoints.
+        // The full graph is the disjoint union of the former per-label graphs.
+        // Matching and independent-set cardinalities add over that union.
+        {
+            let horizontal = groups.horizontal.as_slice();
+            let vertical = groups.vertical.as_slice();
             let profile = matching.maximum_independent_set_profile(horizontal, vertical);
             timings.matching += profile.timings.total;
             timings.matching_greedy += profile.timings.greedy;
@@ -518,6 +531,7 @@ impl SparseOptimalScratch64 {
         Ok(timings)
     }
 
+    #[allow(clippy::mut_mut)] // Swap buffer references, not the inline array contents.
     fn sparse_partition(&mut self) -> Result<&[Rectangle], SparseQuadError> {
         build_cut_masks(
             &self.horizontal_cuts,
@@ -960,24 +974,16 @@ fn validate_non_overlapping_line(intervals: &[Interval]) -> Result<(), SparseQua
 
 // Chord 提取
 
-struct SparseChordGroups {
-    groups: FixedVec<SparseChordGroup, MAX_CHORD_GROUPS>,
+struct SparseChords {
     horizontal: ChordBuffer<ValuedChord>,
     vertical: ChordBuffer<ValuedChord>,
 }
 
-#[derive(Clone, Copy, Debug, Default, Eq, PartialEq)]
-struct SparseChordGroup {
-    horizontal_start: usize,
-    horizontal_end: usize,
-    vertical_start: usize,
-    vertical_end: usize,
-}
-
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct ValuedChord {
+    // Labels are retained only for profiling and the geometric invariant tests.
+    #[cfg_attr(not(any(test, feature = "profile")), allow(dead_code))]
     value: u16,
-    order: u16,
     chord: EffectiveChord,
 }
 
@@ -987,111 +993,54 @@ impl ChordAccess for ValuedChord {
     }
 }
 
-impl SparseChordGroups {
+impl SparseChords {
     const fn new() -> Self {
         Self {
-            groups: FixedVec::new(SparseChordGroup {
-                horizontal_start: 0,
-                horizontal_end: 0,
-                vertical_start: 0,
-                vertical_end: 0,
-            }),
             horizontal: FixedVec::new(EMPTY_CHORD),
             vertical: FixedVec::new(EMPTY_CHORD),
         }
     }
 
     const fn clear(&mut self) {
-        self.groups.clear();
         self.horizontal.clear();
         self.vertical.clear();
     }
 
     fn add_horizontal(&mut self, value: u16, chord: EffectiveChord) -> Result<(), SparseQuadError> {
         reserve_one(&self.horizontal)?;
-        let order = crate::u16_index(self.horizontal.len());
-        self.horizontal.push(ValuedChord {
-            value,
-            order,
-            chord,
-        });
+        self.horizontal.push(ValuedChord { value, chord });
         Ok(())
     }
 
     fn add_vertical(&mut self, value: u16, chord: EffectiveChord) -> Result<(), SparseQuadError> {
         reserve_one(&self.vertical)?;
-        let order = crate::u16_index(self.vertical.len());
-        self.vertical.push(ValuedChord {
-            value,
-            order,
-            chord,
-        });
+        self.vertical.push(ValuedChord { value, chord });
         Ok(())
     }
 
-    fn finish(&mut self) -> Result<(), SparseQuadError> {
-        self.horizontal
-            .sort_unstable_by_key(|item| (item.value, item.order));
-        self.vertical
-            .sort_unstable_by_key(|item| (item.value, item.order));
-        self.groups.clear();
-
-        let (mut horizontal_index, mut vertical_index) = (0usize, 0usize);
-        while horizontal_index < self.horizontal.len() || vertical_index < self.vertical.len() {
-            let value = match (
-                self.horizontal.get(horizontal_index),
-                self.vertical.get(vertical_index),
-            ) {
-                (Some(horizontal), Some(vertical)) => horizontal.value.min(vertical.value),
-                (Some(horizontal), None) => horizontal.value,
-                (None, Some(vertical)) => vertical.value,
-                (None, None) => break,
-            };
-
-            let horizontal_start = horizontal_index;
-            while self
-                .horizontal
-                .get(horizontal_index)
-                .is_some_and(|item| item.value == value)
-            {
-                horizontal_index += 1;
+    // Preserve the public profiling field's meaning: number of distinct labels
+    // with at least one chord. This read-only count is outside the ordinary path.
+    #[cfg(any(test, feature = "profile"))]
+    fn logical_group_count(&self) -> usize {
+        let mut labels = [0u64; 1024];
+        let mut count = 0;
+        for item in self.horizontal.iter().chain(self.vertical.iter()) {
+            let label = usize::from(item.value);
+            let word = crate::get_mut(&mut labels, label / 64);
+            let bit = 1u64 << (label % 64);
+            if *word & bit == 0 {
+                *word |= bit;
+                count += 1;
             }
-            let vertical_start = vertical_index;
-            while self
-                .vertical
-                .get(vertical_index)
-                .is_some_and(|item| item.value == value)
-            {
-                vertical_index += 1;
-            }
-
-            reserve_one(&self.groups)?;
-            self.groups.push(SparseChordGroup {
-                horizontal_start,
-                horizontal_end: horizontal_index,
-                vertical_start,
-                vertical_end: vertical_index,
-            });
         }
-        Ok(())
-    }
-
-    fn horizontal(&self, group: &SparseChordGroup) -> &[ValuedChord] {
-        slice(
-            &self.horizontal,
-            group.horizontal_start..group.horizontal_end,
-        )
-    }
-
-    fn vertical(&self, group: &SparseChordGroup) -> &[ValuedChord] {
-        slice(&self.vertical, group.vertical_start..group.vertical_end)
+        count
     }
 }
 
 fn extract_sparse_chords(
     rows: &AxisIntervals,
     columns: &AxisIntervals,
-    groups: &mut SparseChordGroups,
+    groups: &mut SparseChords,
 ) -> Result<(), SparseQuadError> {
     groups.clear();
     for y in 1u8..EDGE_U8 {
@@ -1110,7 +1059,6 @@ fn extract_sparse_chords(
             groups,
         )?;
     }
-    groups.finish()?;
     Ok(())
 }
 
@@ -1148,7 +1096,7 @@ fn emit_horizontal_chords_for_boundary(
     first: &[Interval],
     second: &[Interval],
     y: u8,
-    groups: &mut SparseChordGroups,
+    groups: &mut SparseChords,
 ) -> Result<(), SparseQuadError> {
     emit_chords_for_boundary(first, second, |interval| {
         groups.add_horizontal(
@@ -1168,7 +1116,7 @@ fn emit_vertical_chords_for_boundary(
     first: &[Interval],
     second: &[Interval],
     x: u8,
-    groups: &mut SparseChordGroups,
+    groups: &mut SparseChords,
 ) -> Result<(), SparseQuadError> {
     emit_chords_for_boundary(first, second, |interval| {
         groups.add_vertical(
@@ -1481,7 +1429,7 @@ mod tests {
         let Some(rectangles) = ok(scratch.decompose_quads(&sparse_image)) else {
             return;
         };
-        assert!(rectangles.is_empty());
+        assert_eq!(rectangles, []);
     }
 
     #[test]
@@ -1604,7 +1552,7 @@ mod tests {
         let Some(rects) = ok(scratch.decompose(&leaves)) else {
             return;
         };
-        assert!(!rects.is_empty());
+        assert_ne!(rects, []);
     }
 
     #[test]
@@ -1618,7 +1566,7 @@ mod tests {
         let Some(rects) = ok(scratch.decompose(&leaves)) else {
             return;
         };
-        assert!(!rects.is_empty());
+        assert_ne!(rects, []);
     }
 
     #[test]
@@ -1635,7 +1583,7 @@ mod tests {
         let Some(rects) = ok(scratch.decompose(&leaves)) else {
             return;
         };
-        assert!(!rects.is_empty());
+        assert_ne!(rects, []);
     }
 
     #[test]
@@ -1745,9 +1693,103 @@ mod tests {
             return;
         };
         assert_eq!(rectangles.len(), 2 * 32 * 21);
-        assert_eq!(scratch.chord_groups.groups.len(), 32 * 21);
+        assert_eq!(scratch.chord_groups.logical_group_count(), 32 * 21);
         assert_eq!(scratch.chord_groups.horizontal.len(), 32 * 21);
         assert!(scratch.chord_groups.vertical.is_empty());
+    }
+
+    #[test]
+    #[allow(clippy::indexing_slicing)] // All indices are bounded by the fixed 3x3 oracle.
+    fn global_chord_graph_preserves_colored_optima_on_all_three_by_three_images() {
+        // Independent exact pixel-partition oracle. The first occupied pixel must
+        // be the top-left corner of the rectangle that covers it; try every
+        // legal bottom-right corner, then use the already solved smaller mask.
+        let mut optimum = [0usize; 512];
+        for mask in 1usize..512 {
+            let first = mask.trailing_zeros() as usize;
+            let (start_x, start_y) = (first % 3, first / 3);
+            let mut best = 9;
+            for end_y in start_y + 1..=3 {
+                for end_x in start_x + 1..=3 {
+                    let mut rectangle = 0usize;
+                    for y in start_y..end_y {
+                        for x in start_x..end_x {
+                            rectangle |= 1 << (y * 3 + x);
+                        }
+                    }
+                    if rectangle & mask == rectangle {
+                        best = best.min(1 + optimum[mask ^ rectangle]);
+                    }
+                }
+            }
+            optimum[mask] = best;
+        }
+
+        let mut scratch = SparseOptimalScratch64::new();
+        let mut leaves = Vec::with_capacity(9);
+        for encoded in 0..3usize.pow(9) {
+            leaves.clear();
+            let mut remaining = encoded;
+            let mut expected = [0u16; 9];
+            let mut masks = [0usize; 3];
+            for (pixel, expected_label) in expected.iter_mut().enumerate() {
+                let label = remaining % 3;
+                remaining /= 3;
+                *expected_label = crate::u16_index(label);
+                masks[label] |= 1 << pixel;
+                if label != 0 {
+                    leaves.push(leaf(
+                        u8::try_from(pixel % 3).unwrap_or_default(),
+                        u8::try_from(pixel / 3).unwrap_or_default(),
+                        0,
+                        nz(crate::u16_index(label)),
+                    ));
+                }
+            }
+            let Some(rectangles) = ok(scratch.decompose_borrowed(&leaves)) else {
+                return;
+            };
+            assert_eq!(rectangles.len(), optimum[masks[1]] + optimum[masks[2]]);
+            let mut actual = [0u16; 9];
+            for rectangle in rectangles {
+                assert!(rectangle.x.end <= 3 && rectangle.y.end <= 3);
+                for y in rectangle.y.start..rectangle.y.end {
+                    for x in rectangle.x.start..rectangle.x.end {
+                        let pixel = usize::from(y) * 3 + usize::from(x);
+                        assert_eq!(actual[pixel], 0);
+                        actual[pixel] = rectangle.value;
+                    }
+                }
+            }
+            assert_eq!(actual, expected);
+
+            // These geometric invariants justify both the single global graph
+            // and the O(n^2) total chord-grid-writing bound across all labels.
+            for chords in [
+                &scratch.chord_groups.horizontal,
+                &scratch.chord_groups.vertical,
+            ] {
+                for (index, first) in chords.iter().enumerate() {
+                    for second in chords.iter().skip(index + 1) {
+                        let (a, b) = (first.chord, second.chord);
+                        if a.orientation == Orientation::Horizontal && a.y1 == b.y1 {
+                            assert!(a.x2 < b.x1 || b.x2 < a.x1);
+                        }
+                        if a.orientation == Orientation::Vertical && a.x1 == b.x1 {
+                            assert!(a.y2 < b.y1 || b.y2 < a.y1);
+                        }
+                    }
+                }
+            }
+            for horizontal in &scratch.chord_groups.horizontal {
+                for vertical in &scratch.chord_groups.vertical {
+                    let (h, v) = (horizontal.chord, vertical.chord);
+                    if (h.x1..=h.x2).contains(&v.x1) && (v.y1..=v.y2).contains(&h.y1) {
+                        assert_eq!(horizontal.value, vertical.value);
+                    }
+                }
+            }
+        }
     }
 
     #[test]
