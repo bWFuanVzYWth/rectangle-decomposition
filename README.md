@@ -19,17 +19,26 @@
 
 将本仓库作为 Cargo 的本地 `path` 依赖加入项目，路径按实际位置调整：
 
-当前 SIMD 实验使用 nightly 的 `std::simd`（`portable_simd`），需要 nightly Rust 工具链；显式 SIMD 数据向量统一为 512 bit。无需 AVX-512，编译器可将逻辑向量拆为目标平台支持的较窄指令。
+库始终使用 `#![no_std]`，默认 feature 为空，默认构建不引用 `alloc`，也不需要全局分配器。SIMD 使用 nightly 的 `core::simd`（`portable_simd`）；显式 SIMD 数据向量统一为 512 bit。无需 AVX-512，编译器可将逻辑向量拆为目标平台支持的较窄指令。内部不变量失败还使用 nightly 的 `core::process::abort_immediate`（`abort_immediate`），当前在 Rust 1.100.0-nightly 验证。
 
 ```toml
 [dependencies]
 rectangle_decomposition = { path = "../rectangle_decomposition" }
 ```
 
-然后使用可复用的 scratch：
+六个核心入口默认可用：叶子输入的 `decompose_borrowed`、`decompose_into`、`decompose_packed`，以及标签输入的 `decompose_labels_borrowed`、`decompose_labels_into`、`decompose_labels_packed`。
+
+| Feature | 增加的功能 | 依赖 |
+| --- | --- | --- |
+| 默认 `[]` | 固定容量 scratch、标签切面、借用／sink／packed 输出 | `core` |
+| `alloc` | `SparseQuadImage64`、`SparseLayerBuilder64`、返回 `Vec<Rectangle>` 的接口 | `core`、`alloc`；最终程序提供分配器 |
+| `std` | 内部不变量失败时保留进程 abort 行为 | 启用 `alloc`，链接 `std` |
+| `profile` | 分阶段计时和规模统计 | 启用 `std` |
+
+需要拥有型容器时，为依赖添加 `features = ["alloc"]`。下面示例在普通宿主程序中运行，程序自身可以使用 `std`，依赖库仍为默认 no_std／no_alloc 构建。每个 worker 使用可复用的 scratch：
 
 ```rust
-use std::num::NonZeroU16;
+use core::num::NonZeroU16;
 use rectangle_decomposition::{QuadLeaf64, SparseOptimalScratch64, SparseQuadError};
 
 fn main() -> Result<(), SparseQuadError> {
@@ -80,7 +89,9 @@ fn main() -> Result<(), SparseQuadError> {
 
 大量单位面适合由上游直接填充标签切面；只有少量大 LOD 块时保留叶子输入，避免扫描整个网格。直接 sink 便于写入下游已有布局，实际收益取决于消费者，不能保证每种输出布局都更快。
 
-也提供拥有输入的 `SparseQuadImage64`、增量输入的 `SparseLayerBuilder64`，以及返回 `Vec<Rectangle>` 的便捷接口；这些拥有型容器可以分配堆内存。库本身没有第三方运行时依赖，库代码禁止 `unsafe`。
+`alloc` feature 提供拥有输入的 `SparseQuadImage64`、增量输入的 `SparseLayerBuilder64`，以及返回 `Vec<Rectangle>` 的便捷接口；这些拥有型容器可以分配堆内存。库本身没有第三方运行时依赖，库代码禁止 `unsafe`。
+
+库不定义 `panic_handler`。未启用 `std` 时，内部不变量失败调用 `core::process::abort_immediate`，通过平台的 trap／abort 行为立即终止，不展开栈；启用 `std` 时使用进程 abort。非法形状、越界、重叠和 sink 返回的错误仍通过 `Result` 传播。裸机程序负责入口、运行时，以及处理普通 panic 和 debug assertion 的 panic handler，链接验证见 [研究与验证](docs/research.md)。
 
 ## 接手研究的阅读顺序
 
@@ -95,11 +106,15 @@ fn main() -> Result<(), SparseQuadError> {
 ## 开发入口
 
 ```sh
+cargo check --lib --no-default-features
+cargo check --lib --features alloc
+cargo check --lib --features std
+cargo test
 cargo test --all-features
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
-cargo bench --bench worst_case
+cargo bench --features alloc --bench worst_case
 cargo run --release --features profile --example worst_case_profile
 ```
 
-`profile` feature 提供分阶段计时；Criterion 仅为开发依赖。基准的范围和正确使用方式见 [研究与验证](docs/research.md)。
+默认配置运行 63 项测试；`alloc` 或全部 features 运行 71 项。测试程序可以使用宿主 `std`，默认库的零分配契约仍由分配计数器验证。Criterion 仅为开发依赖；`worst_case` benchmark 要求 `alloc`，未启用时 Cargo 会跳过它。跨目标检查、裸机链接验证及基准范围见 [研究与验证](docs/research.md)。

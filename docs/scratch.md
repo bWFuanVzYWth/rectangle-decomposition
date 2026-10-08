@@ -4,15 +4,17 @@
 
 ## 接口如何选择
 
+库始终为 `no_std`，默认 features 为 `[]`，仅依赖 `core`，无 `alloc` 依赖或全局分配器要求。前四行的六个分解入口默认可用；拥有型接口须启用 `alloc`。`std` 会启用 `alloc`，`profile` 会启用 `std`。
+
 | 场景 | 入口 | 内存行为 |
 | --- | --- | --- |
 | 上游直接提供行主序标签切面 | `scratch.decompose_labels_borrowed(&labels)` | 输入无需叶子校验，借用输出，内部不分配 |
 | 已有叶子切片，直接分解 | `scratch.decompose_borrowed(&leaves)` | 校验输入，借用输出，内部不分配 |
 | 每个矩形立即写入 mesh | `decompose_labels_into`、`decompose_into` | 直接调用 sink，不写中间矩形数组；sink 自身可分配 |
 | 下游批量消费 packed bounds / labels | `decompose_labels_packed`、`decompose_packed` | 直接写入调用方的固定容量 `PackedRectangles64`，内部不分配 |
-| 重复使用一个拥有型输入对象 | `SparseQuadImage64::from_leaves` + `decompose_quads_borrowed` | image 构造分配；借用分解不分配 |
-| 希望独立保存返回结果 | `decompose`、`decompose_quads` | 将内部结果复制为 `Vec<Rectangle>`，可以分配 |
-| 逐个提供正方形 | `SparseLayerBuilder64::push_square` + `finish` | builder 保存叶子，返回拥有型结果，可以分配 |
+| 重复使用一个拥有型输入对象（`alloc`） | `SparseQuadImage64::from_leaves` + `decompose_quads_borrowed` | image 构造分配；借用分解不分配 |
+| 希望独立保存返回结果（`alloc`） | `decompose`、`decompose_quads` | 将内部结果复制为 `Vec<Rectangle>`，可以分配 |
+| 逐个提供正方形（`alloc`） | `SparseLayerBuilder64::push_square` + `finish` | builder 保存叶子，返回拥有型结果，可以分配 |
 
 `DenseLabels64` 为 64 字节对齐的 `[[u16; 64]; 64]`，占 8192 字节，无自有堆缓冲。标签 0 是背景，其余全部 u16 值均合法；上游可直接写入 `rows_mut()`。`new()` 与 `clear()` 将标签置零，均不分配。
 
@@ -29,6 +31,8 @@
 scratch 内部全部为固定容量、已初始化的数组，没有 `Vec`、`Box` 或指向自有堆缓冲的指针。`FixedVec<T, N>` 使用 `[T; N] + len`，只接受 `Copy` 元素；清空仅重置有效长度，算法按需重置配对和标记。
 
 因此构造、所有借用分解入口、packed 输出和析构都不调用堆分配器。借用输出切片位于 scratch 对象内部，下一次可变使用会覆盖它，必须事先消费完毕。直接 sink 与 packed 输出不写入这份中间矩形数组；packed 缓冲由调用方持有，可以跨 scratch 调用保留。这一契约不包含调用方构造拥有型输入、保存结果或 sink 写入 mesh 时的分配。
+
+默认配置不仅不调用分配器，编译后的库也不链接 `alloc`。选择 `alloc` 而不选择 `std` 仍可用于带分配器的 no_std 程序；调用方负责提供分配器。库不定义 `panic_handler`，裸机程序负责启动入口、运行时，以及普通 panic 和 debug assertion 的处理。未启用 `std` 时，内部不变量失败调用 nightly 的 `core::process::abort_immediate`，通过平台 trap／abort 立即终止且不展开栈；`std` 配置保留进程 abort。正常输入校验和 sink 错误使用 `Result`，不因 feature 选择而改变。独立裸机链接 fixture 与复现命令见 [研究与验证](research.md)。
 
 ## 固定容量从哪里来
 
@@ -62,7 +66,7 @@ scratch 内部全部为固定容量、已初始化的数组，没有 `Vec`、`Bo
 
 拥有型 image 的大乱序输入排序使用 **16 KiB 临时栈数组**，不位于 scratch 内，不用于普通借用分解；小输入和已排序输入不走此路径。image 的叶子 Vec 仍允许堆分配，但无需第二个排序 Vec。
 
-批量 Morton 编码另用固定局部 staging 和 512-bit portable SIMD 数据向量，不增加堆分配；连续标签切面也使用 512-bit u16 数据向量比较相邻像素及行。逻辑向量宽度不代表目标机器具有对应硬件寄存器。实际调用栈峰值仍取决于编译器的拆分、spill 和内联选择。调用方持有的 `DenseLabels64` 和 `PackedRectangles64` 也应计入所在栈帧。
+`alloc` 配置的批量 Morton 编码另用固定局部 staging 和 512-bit portable SIMD 数据向量，不增加额外堆分配；默认配置的连续标签切面也使用 512-bit u16 数据向量比较相邻像素及行。SIMD 来自 nightly `core::simd`，无需 AVX-512；逻辑向量宽度不代表目标机器具有对应硬件寄存器。实际调用栈峰值仍取决于编译器的拆分、spill 和内联选择。调用方持有的 `DenseLabels64` 和 `PackedRectangles64` 也应计入所在栈帧。
 
 profile/test 的逻辑标签计数使用额外 **8 KiB 临时位集**，不在 scratch 对象内；普通借用分解不执行这项计数。它仍不分配堆内存，但应计入 profile 调用链的栈预算。
 

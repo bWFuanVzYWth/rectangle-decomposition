@@ -6,9 +6,10 @@ use std::cell::Cell;
 use std::hint::black_box;
 use std::num::NonZeroU16;
 
+#[cfg(feature = "alloc")]
+use rectangle_decomposition::SparseQuadImage64;
 use rectangle_decomposition::{
     DenseLabels64, PackedRectangles64, QuadLeaf64, SparseOptimalScratch64, SparseQuadError,
-    SparseQuadImage64,
 };
 
 thread_local! {
@@ -114,6 +115,7 @@ fn construction_and_reused_borrowed_output_do_not_allocate() -> Result<(), Spars
 }
 
 #[test]
+#[cfg(feature = "alloc")]
 fn prepared_images_and_leaves_share_scratch_without_allocating() -> Result<(), SparseQuadError> {
     let fragmented =
         [(0, 0, 0), (1, 0, 0), (1, 1, 0), (2, 1, 0), (8, 8, 1)].map(|(u, v, lod)| QuadLeaf64 {

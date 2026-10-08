@@ -1,6 +1,6 @@
 //! 连续标签切面：SIMD 比较相邻行／像素，直接构造最大同色区间。
 
-use std::simd::{cmp::SimdPartialEq, u16x32};
+use core::simd::{cmp::SimdPartialEq, u16x32};
 
 use super::{
     AxisIntervals, EDGE, EDGE_U8, Interval, IntervalBucket, LineRange, QuadLeaf64,
@@ -181,7 +181,7 @@ fn append_row(row: &[u16; EDGE], output: &mut AxisIntervals) -> Result<LineRange
         let right = if boundaries == 0 {
             EDGE_U8
         } else {
-            u8::try_from(boundaries.trailing_zeros()).unwrap_or_else(|_| std::process::abort())
+            u8::try_from(boundaries.trailing_zeros()).unwrap_or_else(|_| crate::invariant_failed())
         };
         let value = copy(row, usize::from(left));
         if value != 0 {
@@ -227,8 +227,8 @@ pub(super) fn build_axes(
         }
         *get_mut(&mut rows.lines, usize::from(y)) = range;
         while changes != 0 {
-            let x =
-                usize::try_from(changes.trailing_zeros()).unwrap_or_else(|_| std::process::abort());
+            let x = usize::try_from(changes.trailing_zeros())
+                .unwrap_or_else(|_| crate::invariant_failed());
             let value = copy(&column_values, x);
             if value != 0 {
                 get_mut(column_buckets, x).try_push(Interval {
@@ -260,7 +260,8 @@ pub(super) fn build_axes(
 mod tests {
     use super::super::push_leaf_axis_intervals_one;
     use super::*;
-    use std::num::NonZeroU16;
+    use core::num::NonZeroU16;
+    use std::{boxed::Box, vec::Vec};
 
     fn buckets() -> Box<[IntervalBucket; EDGE]> {
         (0..EDGE)
@@ -268,13 +269,13 @@ mod tests {
             .collect::<Vec<_>>()
             .into_boxed_slice()
             .try_into()
-            .unwrap_or_else(|_| std::process::abort())
+            .unwrap_or_else(|_| crate::invariant_failed())
     }
 
     #[test]
     fn dense_axes_match_independent_unit_buckets_for_all_lane_boundaries() {
-        assert_eq!(std::mem::size_of::<DenseLabels64>(), 8192);
-        assert_eq!(std::mem::align_of::<DenseLabels64>(), 64);
+        assert_eq!(core::mem::size_of::<DenseLabels64>(), 8192);
+        assert_eq!(core::mem::align_of::<DenseLabels64>(), 64);
         let mut labels = DenseLabels64::new();
         let mut reference_rows = AxisIntervals::new();
         let mut reference_columns = AxisIntervals::new();

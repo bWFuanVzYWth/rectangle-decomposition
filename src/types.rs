@@ -1,6 +1,6 @@
 //! 矩形分解的公共类型。
 
-/// 左闭右开的 `u8` 范围，模仿 `std::ops::Range` 命名。
+/// 左闭右开的 `u8` 范围，模仿 `core::ops::Range` 命名。
 #[derive(Clone, Copy, Debug, Eq, Hash, PartialEq)]
 pub struct RangeU8 {
     /// 起始坐标（含）。
@@ -17,7 +17,7 @@ impl RangeU8 {
     }
 }
 
-impl From<RangeU8> for std::ops::Range<u8> {
+impl From<RangeU8> for core::ops::Range<u8> {
     fn from(r: RangeU8) -> Self {
         r.start..r.end
     }

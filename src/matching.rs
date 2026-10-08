@@ -5,6 +5,8 @@
 
 #[cfg(feature = "profile")]
 use std::time::{Duration, Instant};
+#[cfg(test)]
+use std::vec::Vec;
 
 use crate::fixed::FixedVec;
 use crate::types::ChordAccess;
@@ -369,6 +371,8 @@ fn selected_from_scratch(scratch: &MatchingScratch) -> MaximumIndependentSet {
 
 #[cfg(test)]
 mod tests {
+    use std::boxed::Box;
+
     use super::*;
     use crate::types::Orientation;
 

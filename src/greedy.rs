@@ -151,6 +151,8 @@ fn counting_sort_right_order_u16(
 #[cfg(test)]
 #[allow(clippy::indexing_slicing)] // 穷举图与配对的编号由显式尺寸界定。
 mod tests {
+    use std::{vec, vec::Vec};
+
     use super::*;
 
     // 独立保留逐次重扫的参考实现，验证游标不会改变任何配对选择。

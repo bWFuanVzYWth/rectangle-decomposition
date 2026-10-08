@@ -1,3 +1,5 @@
+#![cfg(feature = "alloc")]
+
 use std::num::NonZeroU16;
 
 use rectangle_decomposition::{QuadLeaf64, SparseQuadError, SparseQuadImage64};

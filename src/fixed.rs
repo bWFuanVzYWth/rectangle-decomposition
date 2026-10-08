@@ -1,6 +1,6 @@
 //! 全部元素已初始化的固定容量缓冲；清空仅重置长度，不调用分配器。
 
-use std::ops::{Deref, DerefMut};
+use core::ops::{Deref, DerefMut};
 
 use crate::{copy, get_mut};
 
@@ -89,7 +89,7 @@ impl<T: Copy, const N: usize> DerefMut for FixedVec<T, N> {
 
 impl<'a, T: Copy, const N: usize> IntoIterator for &'a FixedVec<T, N> {
     type Item = &'a T;
-    type IntoIter = std::slice::Iter<'a, T>;
+    type IntoIter = core::slice::Iter<'a, T>;
     fn into_iter(self) -> Self::IntoIter {
         self.iter()
     }

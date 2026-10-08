@@ -182,7 +182,7 @@ fn sweep_conflict_events<H: ChordAccess, V: ChordAccess>(
             let start = scratch.edge_count;
             while conflicts != 0 {
                 let y = usize::try_from(conflicts.trailing_zeros())
-                    .unwrap_or_else(|_| std::process::abort());
+                    .unwrap_or_else(|_| crate::invariant_failed());
                 *get_mut(&mut scratch.edge_buffer, scratch.edge_count) = SparseEdge {
                     left: copy(&scratch.active_horizontal, y),
                     right: vertical_index,
@@ -190,8 +190,8 @@ fn sweep_conflict_events<H: ChordAccess, V: ChordAccess>(
                 scratch.edge_count += 1;
                 conflicts &= conflicts - 1;
             }
-            *get_mut(&mut scratch.right_degrees, index) =
-                u8::try_from(scratch.edge_count - start).unwrap_or_else(|_| std::process::abort());
+            *get_mut(&mut scratch.right_degrees, index) = u8::try_from(scratch.edge_count - start)
+                .unwrap_or_else(|_| crate::invariant_failed());
             vertical_index =
                 u16_index(copy(&scratch.right_layout, horizontal_edges.len() + index) as usize);
         }
@@ -227,6 +227,8 @@ fn internal_mask(start: u8, end: u8) -> u64 {
 #[cfg(test)]
 #[allow(clippy::indexing_slicing)] // 列表中的编号均由 0..63 构造。
 mod tests {
+    use std::{vec, vec::Vec};
+
     use super::*;
     use crate::matching::{HkScratch, IMAGE64_AXIS_LEN, MatchingScratch};
     use crate::types::{EffectiveChord, Orientation};

@@ -3,9 +3,11 @@
 use std::num::NonZeroU16;
 
 use rectangle_decomposition::{
-    DenseLabels64, PackedRectangles64, QuadLeaf64, Rectangle, SparseLayerBuilder64,
-    SparseOptimalScratch64, SparseQuadError, SparseQuadImage64,
+    DenseLabels64, PackedRectangles64, QuadLeaf64, Rectangle, SparseOptimalScratch64,
+    SparseQuadError,
 };
+#[cfg(feature = "alloc")]
+use rectangle_decomposition::{SparseLayerBuilder64, SparseQuadImage64};
 
 const fn next_random(state: &mut u64) -> u64 {
     *state ^= *state << 13;
@@ -75,6 +77,7 @@ fn compressed_events_match_unit_pixels_for_shuffled_quadtree_layers() -> Result<
 {
     let mut state = 0x6a09_e667_f3bc_c909;
     let mut scratch = SparseOptimalScratch64::new();
+    #[cfg(feature = "alloc")]
     let mut builder = SparseLayerBuilder64::new();
     let mut packed = PackedRectangles64::new();
     for case in 0..128 {
@@ -95,7 +98,7 @@ fn compressed_events_match_unit_pixels_for_shuffled_quadtree_layers() -> Result<
                 })
             })
             .collect();
-        let expected_rectangles = scratch.decompose(&pixels)?;
+        let expected_rectangles = scratch.decompose_borrowed(&pixels)?.to_vec();
         assert_coverage(&expected_rectangles, &expected_pixels);
         let mut dense = DenseLabels64::new();
         for (row, values) in dense
@@ -123,7 +126,6 @@ fn compressed_events_match_unit_pixels_for_shuffled_quadtree_layers() -> Result<
                     usize::try_from(next_random(&mut state)).unwrap_or_default() % leaves.len();
                 leaves.rotate_left(shift);
             }
-            let image = SparseQuadImage64::from_leaves(&leaves)?;
             assert_eq!(scratch.decompose_borrowed(&leaves)?, &expected_rectangles);
             let mut direct = Vec::new();
             assert_eq!(
@@ -139,15 +141,20 @@ fn compressed_events_match_unit_pixels_for_shuffled_quadtree_layers() -> Result<
                 expected_rectangles.len()
             );
             assert!(packed.iter().eq(expected_rectangles.iter().copied()));
-            assert_eq!(
-                scratch.decompose_quads_borrowed(&image)?,
-                &expected_rectangles
-            );
-            builder.clear();
-            for leaf in &leaves {
-                builder.push_square(leaf.u, leaf.v, leaf.lod, leaf.value)?;
+            #[cfg(feature = "alloc")]
+            {
+                let image = SparseQuadImage64::from_leaves(&leaves)?;
+                assert_eq!(
+                    scratch.decompose_quads_borrowed(&image)?,
+                    &expected_rectangles
+                );
+                assert_eq!(scratch.decompose(&leaves)?, expected_rectangles);
+                builder.clear();
+                for leaf in &leaves {
+                    builder.push_square(leaf.u, leaf.v, leaf.lod, leaf.value)?;
+                }
+                assert_eq!(builder.finish(&mut scratch)?, expected_rectangles);
             }
-            assert_eq!(builder.finish(&mut scratch)?, expected_rectangles);
         }
     }
     Ok(())

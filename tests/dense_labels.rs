@@ -4,9 +4,11 @@
 
 use std::num::NonZeroU16;
 
+#[cfg(feature = "alloc")]
+use rectangle_decomposition::SparseQuadImage64;
 use rectangle_decomposition::{
     DenseLabels64, PackedRectangles64, QuadLeaf64, Rectangle, SparseOptimalScratch64,
-    SparseQuadError, SparseQuadImage64,
+    SparseQuadError,
 };
 
 fn pixels(labels: &DenseLabels64) -> Vec<QuadLeaf64> {
@@ -127,7 +129,7 @@ fn lane_boundaries_and_extreme_labels_match_small_leaf_event_path() -> Result<()
         }
         let leaves = pixels(&labels);
         assert!(leaves.len() < 512, "reference must use the event path");
-        let expected = scratch.decompose(&leaves)?;
+        let expected = scratch.decompose_borrowed(&leaves)?.to_vec();
         assert_coverage(&expected, &labels);
         assert_eq!(scratch.decompose_labels_borrowed(&labels)?, &expected);
         assert_eq!(
@@ -227,9 +229,12 @@ fn automatic_raster_threshold_preserves_unit_and_mixed_lod_output() -> Result<()
                 if reverse {
                     leaves.reverse();
                 }
-                let image = SparseQuadImage64::from_leaves(&leaves)?;
                 assert_eq!(scratch.decompose_borrowed(&leaves)?, &expected);
-                assert_eq!(scratch.decompose_quads_borrowed(&image)?, &expected);
+                #[cfg(feature = "alloc")]
+                {
+                    let image = SparseQuadImage64::from_leaves(&leaves)?;
+                    assert_eq!(scratch.decompose_quads_borrowed(&image)?, &expected);
+                }
                 assert_eq!(
                     scratch.decompose_packed(&leaves, &mut packed)?,
                     expected.len()

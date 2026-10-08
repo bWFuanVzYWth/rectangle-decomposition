@@ -3,18 +3,23 @@
 //! 输入为非零 dyadic square 列表或连续标签切面，内部派生区间、chord 与 cut。
 //! 少量叶子使用区间事件；大量叶子使用 SIMD 栅格扫描。
 
-use std::num::NonZeroU16;
-use std::simd::u16x32;
+#[cfg(feature = "alloc")]
+use alloc::vec::Vec;
+use core::num::NonZeroU16;
+#[cfg(feature = "alloc")]
+use core::simd::u16x32;
 #[cfg(feature = "profile")]
 use std::time::{Duration, Instant};
 
 use crate::fixed::FixedVec;
 use crate::matching::{ChordBuffer, MatchingScratch};
+#[cfg(feature = "alloc")]
+use crate::slice_mut;
 use crate::types::{
     ActiveRect, ChordAccess, EffectiveChord, Orientation, PackedRectangles64, RangeU8, Rectangle,
     Run,
 };
-use crate::{get, slice, slice_mut};
+use crate::{get, slice};
 
 mod dense;
 pub use dense::DenseLabels64;
@@ -127,17 +132,20 @@ struct SelectCutTimings {
 }
 
 /// 固定 64x64 sparse quad image。
+#[cfg(feature = "alloc")]
 #[derive(Clone, Debug, Default)]
 pub struct SparseQuadImage64 {
     leaves: Vec<StoredLeaf>,
 }
 
+#[cfg(feature = "alloc")]
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct StoredLeaf {
     leaf: QuadLeaf64,
     morton_start: u16,
 }
 
+#[cfg(feature = "alloc")]
 impl StoredLeaf {
     const fn morton_end(self) -> u16 {
         // 已验证的 dyadic square 占据一个连续 Morton 区间，终点最多为 4096。
@@ -145,6 +153,7 @@ impl StoredLeaf {
     }
 }
 
+#[cfg(feature = "alloc")]
 impl SparseQuadImage64 {
     /// 从非零 quad leaves 构造 sparse image。
     ///
@@ -295,6 +304,7 @@ impl SparseOptimalScratch64 {
     /// # Errors
     ///
     /// leaf 越界、未按 lod 对齐、lod 超出范围、互相重叠或内部缓存无法分配时返回错误。
+    #[cfg(feature = "alloc")]
     pub fn decompose(&mut self, leaves: &[QuadLeaf64]) -> Result<Vec<Rectangle>, SparseQuadError> {
         Ok(self.decompose_borrowed(leaves)?.to_vec())
     }
@@ -453,6 +463,7 @@ impl SparseOptimalScratch64 {
     /// # Errors
     ///
     /// 当内部缓存无法分配时返回错误。
+    #[cfg(feature = "alloc")]
     pub fn decompose_quads(
         &mut self,
         image: &SparseQuadImage64,
@@ -465,6 +476,7 @@ impl SparseOptimalScratch64 {
     /// # Errors
     ///
     /// 当内部缓存无法分配时返回错误。
+    #[cfg(feature = "alloc")]
     pub fn decompose_quads_borrowed(
         &mut self,
         image: &SparseQuadImage64,
@@ -659,11 +671,13 @@ impl SparseOptimalScratch64 {
 ///
 /// 只接受非零 dyadic square。builder 内部保留未展开的 leaves，
 /// finish 使用与借用分解相同的稀疏／栅格路径，无需预合并相邻 square。
+#[cfg(feature = "alloc")]
 #[derive(Debug, Default)]
 pub struct SparseLayerBuilder64 {
     leaves: Vec<QuadLeaf64>,
 }
 
+#[cfg(feature = "alloc")]
 impl SparseLayerBuilder64 {
     #[must_use]
     pub fn new() -> Self {
@@ -714,6 +728,7 @@ impl SparseLayerBuilder64 {
 
 // 12 bit Morton 键直接映射源位置，再转成目的位置置换；每次交换固定一个位置。
 // 小输入比较排序有固定上限，避免初始化和扫描 4096 键的常数代价。
+#[cfg(feature = "alloc")]
 fn sort_stored_leaves_by_morton(leaves: &mut [StoredLeaf]) -> Result<(), SparseQuadError> {
     if leaves.len() <= EDGE {
         leaves.sort_unstable_by_key(|leaf| leaf.morton_start);
@@ -749,6 +764,7 @@ fn sort_stored_leaves_by_morton(leaves: &mut [StoredLeaf]) -> Result<(), SparseQ
     Ok(())
 }
 
+#[cfg(feature = "alloc")]
 fn batch_morton_starts(leaves: &[QuadLeaf64], starts: &mut [u16; EDGE]) {
     for (chunk, output) in leaves.chunks(32).zip(starts.chunks_mut(32)) {
         let mut coordinates_u = [0u16; 32];
@@ -771,6 +787,7 @@ fn batch_morton_starts(leaves: &[QuadLeaf64], starts: &mut [u16; EDGE]) {
     }
 }
 
+#[cfg(feature = "alloc")]
 fn validate_leaf(leaf: QuadLeaf64) -> Result<StoredLeaf, SparseQuadError> {
     validate_leaf_shape(leaf)?;
 
@@ -1327,7 +1344,7 @@ where
             &mut counted_sink,
         )?;
         // 交换视图，避免逐行复制两个内联数组。
-        std::mem::swap(&mut active, &mut next_active);
+        core::mem::swap(&mut active, &mut next_active);
         boundaries &= boundaries - 1;
     }
     for &active_rect in active.as_slice() {
@@ -1514,6 +1531,7 @@ fn cell_range_mask(start: u8, end: u8) -> u64 {
 
 // 工具函数
 
+#[cfg(feature = "alloc")]
 fn allocate_exact<T>(items: &mut Vec<T>, additional: usize) -> Result<(), SparseQuadError> {
     if items.capacity().saturating_sub(items.len()) >= additional {
         return Ok(());
@@ -1523,6 +1541,7 @@ fn allocate_exact<T>(items: &mut Vec<T>, additional: usize) -> Result<(), Sparse
         .map_err(|_| SparseQuadError::AllocationFailed)
 }
 
+#[cfg(feature = "alloc")]
 fn allocate_more<T>(items: &mut Vec<T>, additional: usize) -> Result<(), SparseQuadError> {
     if items.capacity().saturating_sub(items.len()) >= additional {
         return Ok(());
@@ -1567,6 +1586,9 @@ where
 #[cfg(test)]
 mod tests {
     use std::num::NonZeroU16;
+    use std::prelude::rust_2024::*;
+    #[cfg(feature = "alloc")]
+    use std::vec;
 
     use super::*;
     use crate::get_mut;
@@ -1576,7 +1598,7 @@ mod tests {
     const GENERATED_TILE_EDGE: usize = 8;
 
     fn nz(value: u16) -> NonZeroU16 {
-        NonZeroU16::new(value).unwrap_or_else(|| std::process::abort())
+        NonZeroU16::new(value).unwrap_or_else(|| crate::invariant_failed())
     }
 
     #[test]
@@ -1585,7 +1607,7 @@ mod tests {
     {
         let mut scratch = SparseOptimalScratch64::new();
         let first = [leaf(0, 0, 6, NonZeroU16::MIN)];
-        let expected = scratch.decompose(&first)?;
+        let expected = scratch.decompose_borrowed(&first)?.to_vec();
         let second = [leaf(8, 16, 3, NonZeroU16::MAX)];
         let mut seen = 0;
         assert_eq!(
@@ -1645,10 +1667,19 @@ mod tests {
     }
 
     fn assert_from_leaves_error(leaves: &[QuadLeaf64], expected: SparseQuadError) {
-        let result = SparseQuadImage64::from_leaves(leaves);
-        assert!(matches!(result, Err(error) if error == expected));
+        #[cfg(not(feature = "alloc"))]
+        {
+            let mut scratch = SparseOptimalScratch64::new();
+            assert_eq!(scratch.decompose_borrowed(leaves), Err(expected));
+        }
+        #[cfg(feature = "alloc")]
+        {
+            let result = SparseQuadImage64::from_leaves(leaves);
+            assert!(matches!(result, Err(error) if error == expected));
+        }
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn empty_sparse_image_outputs_no_rectangles() {
         let Some(sparse_image) = ok(SparseQuadImage64::from_leaves(&[])) else {
@@ -1748,7 +1779,7 @@ mod tests {
         }
 
         let mut scratch = SparseOptimalScratch64::new();
-        let Some(canonical) = ok(scratch.decompose(&leaves)) else {
+        let Some(canonical) = ok(scratch.decompose_borrowed(&leaves).map(<[_]>::to_vec)) else {
             return;
         };
         assert_eq!(canonical.len(), 4);
@@ -1812,6 +1843,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn morton_key_sort_matches_comparison_order_for_every_pixel_key() {
         assert_eq!(std::mem::size_of::<StoredLeaf>(), 8);
@@ -1845,6 +1877,7 @@ mod tests {
         assert_eq!(ordered_image.leaves, expected);
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn morton_key_sort_keeps_threshold_overlap_and_shape_error_semantics() {
         for count in [63usize, 64, 65, 512] {
@@ -1927,6 +1960,7 @@ mod tests {
         }
     }
 
+    #[cfg(feature = "alloc")]
     #[test]
     fn builder_reuses_leaf_events_after_clear_and_repeated_finish() {
         let mut builder = SparseLayerBuilder64::new();
@@ -2074,11 +2108,8 @@ mod tests {
     #[test]
     fn single_full_leaf_outputs_one_rectangle() {
         let leaves = [leaf(0, 0, 6, nz(5))];
-        let Some(sparse_image) = ok(SparseQuadImage64::from_leaves(&leaves)) else {
-            return;
-        };
         let mut scratch = SparseOptimalScratch64::new();
-        let Some(rectangles) = ok(scratch.decompose_quads(&sparse_image)) else {
+        let Some(rectangles) = ok(scratch.decompose_borrowed(&leaves)) else {
             return;
         };
         assert_eq!(rectangles.len(), 1);
@@ -2118,13 +2149,19 @@ mod tests {
         assert_from_leaves_error(&leaves, SparseQuadError::Overlap);
 
         let mut scratch = SparseOptimalScratch64::new();
-        assert_eq!(scratch.decompose(&leaves), Err(SparseQuadError::Overlap));
+        assert_eq!(
+            scratch.decompose_borrowed(&leaves),
+            Err(SparseQuadError::Overlap)
+        );
 
-        let mut builder = SparseLayerBuilder64::new();
-        for leaf in leaves {
-            let _ = ok(builder.push_square(leaf.u, leaf.v, leaf.lod, leaf.value));
+        #[cfg(feature = "alloc")]
+        {
+            let mut builder = SparseLayerBuilder64::new();
+            for leaf in leaves {
+                let _ = ok(builder.push_square(leaf.u, leaf.v, leaf.lod, leaf.value));
+            }
+            assert_eq!(builder.finish(&mut scratch), Err(SparseQuadError::Overlap));
         }
-        assert_eq!(builder.finish(&mut scratch), Err(SparseQuadError::Overlap));
     }
 
     #[test]
@@ -2136,7 +2173,7 @@ mod tests {
             leaf(32, 32, 5, nz(1)),
         ];
         let mut scratch = SparseOptimalScratch64::new();
-        let Some(rects) = ok(scratch.decompose(&leaves)) else {
+        let Some(rects) = ok(scratch.decompose_borrowed(&leaves)) else {
             return;
         };
         assert_ne!(rects, []);
@@ -2150,7 +2187,7 @@ mod tests {
             leaf(0, 32, 5, nz(1)),
         ];
         let mut scratch = SparseOptimalScratch64::new();
-        let Some(rects) = ok(scratch.decompose(&leaves)) else {
+        let Some(rects) = ok(scratch.decompose_borrowed(&leaves)) else {
             return;
         };
         assert_ne!(rects, []);
@@ -2167,7 +2204,7 @@ mod tests {
             leaf(32, 48, 4, nz(2)),
         ];
         let mut scratch = SparseOptimalScratch64::new();
-        let Some(rects) = ok(scratch.decompose(&leaves)) else {
+        let Some(rects) = ok(scratch.decompose_borrowed(&leaves)) else {
             return;
         };
         assert_ne!(rects, []);
@@ -2247,17 +2284,20 @@ mod tests {
             assert_eq!(chords.len(), crate::matching::IMAGE64_MAX_CHORDS);
             assert_eq!(chords.len(), chords.capacity());
         }
-        let Some(image) = ok(SparseQuadImage64::from_leaves(&leaves)) else {
-            return;
-        };
-        let Some(event_rectangles) = ok(scratch.decompose_quads_borrowed(&image)) else {
-            return;
-        };
-        assert_eq!(event_rectangles.len(), 1025);
-        for rectangle in event_rectangles {
-            for y in rectangle.y.start..rectangle.y.end {
-                for x in rectangle.x.start..rectangle.x.end {
-                    assert!(x % 2 != 0 || y % 2 != 0);
+        #[cfg(feature = "alloc")]
+        {
+            let Some(image) = ok(SparseQuadImage64::from_leaves(&leaves)) else {
+                return;
+            };
+            let Some(event_rectangles) = ok(scratch.decompose_quads_borrowed(&image)) else {
+                return;
+            };
+            assert_eq!(event_rectangles.len(), 1025);
+            for rectangle in event_rectangles {
+                for y in rectangle.y.start..rectangle.y.end {
+                    for x in rectangle.x.start..rectangle.x.end {
+                        assert!(x % 2 != 0 || y % 2 != 0);
+                    }
                 }
             }
         }

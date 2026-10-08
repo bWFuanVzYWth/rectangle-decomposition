@@ -1,0 +1,13 @@
+[package]
+name = "no_std_reproduction"
+version = "0.1.0"
+edition = "2024"
+publish = false
+
+[dependencies]
+before = { package = "rectangle_decomposition_nostd_before", path = "../../../../target/nostd-before" }
+after = { package = "rectangle_decomposition", path = "../../../..", default-features = false }
+
+[[bin]]
+name = "nostd-comparison"
+path = "main.rs"

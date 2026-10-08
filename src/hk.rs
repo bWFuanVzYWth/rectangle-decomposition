@@ -282,6 +282,8 @@ fn collect_independent_set_marks(scratch: &mut HkScratch) {
 #[cfg(test)]
 #[allow(clippy::indexing_slicing)] // 测试中的编号由各图的显式尺寸界定。
 mod tests {
+    use std::{vec, vec::Vec};
+
     use super::*;
     use crate::matching::MatchingScratch;
 

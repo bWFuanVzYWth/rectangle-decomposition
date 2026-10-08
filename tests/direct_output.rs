@@ -28,7 +28,7 @@ fn checkerboard() -> Vec<QuadLeaf64> {
 fn callback_failure_retains_prefix_and_scratch_is_reusable() -> Result<(), SparseQuadError> {
     let leaves = checkerboard();
     let mut scratch = SparseOptimalScratch64::new();
-    let expected = scratch.decompose(&leaves)?;
+    let expected = scratch.decompose_borrowed(&leaves)?.to_vec();
     for stop in [0, 63, 64, 4095] {
         let mut emitted = Vec::new();
         let result = scratch.decompose_into(&leaves, |rectangle| {
@@ -89,7 +89,7 @@ fn invalid_input_never_calls_sink_and_clears_packed_output() -> Result<(), Spars
 fn packed_output_preserves_max_capacity_order_and_reuses_storage() -> Result<(), SparseQuadError> {
     let leaves = checkerboard();
     let mut scratch = SparseOptimalScratch64::new();
-    let expected = scratch.decompose(&leaves)?;
+    let expected = scratch.decompose_borrowed(&leaves)?.to_vec();
     let mut output = PackedRectangles64::new();
     let bounds_address = output.bounds().as_ptr();
     let labels_address = output.labels().as_ptr();

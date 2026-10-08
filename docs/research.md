@@ -72,21 +72,44 @@
 修改论文算法前，先写清状态不变量，再构造会触发新逻辑的反例或穷举范围。至少覆盖含孔区域、多标签、边界接触、空图、重复调用及非法重叠输入。若改动数据容量或对象构造，还应在 debug 和 release 下检查资源契约。
 
 ```sh
+cargo check --lib --no-default-features
+cargo check --lib --features alloc
+cargo check --lib --features std
+cargo test
+cargo test --features alloc
 cargo test --all-features
 cargo test --release --no-default-features
 cargo clippy --all-targets --all-features -- -D warnings
 cargo fmt --check
 ```
 
+库始终为 `no_std`；默认 features 为空，仅依赖 `core`。`alloc` 开启拥有型 Image／Builder 和返回 Vec 的接口，`std` 包含 `alloc`，`profile` 包含 `std`。默认配置运行 63 项测试，`alloc`／全部 features 运行 71 项；默认测试仍覆盖随机 LOD、原生标签、sink／packed 输出和零分配资源契约。宿主测试程序自身使用 `std` 和测试分配器，不能单凭这些测试证明裸机链接。
+
+默认库已另行检查 `wasm32-unknown-unknown` 目标：
+
+```sh
+cargo check --lib --no-default-features --target wasm32-unknown-unknown
+```
+
+裸机验证使用独立的 [no_std_link fixture](../checks/no_std_link/main.rs)，在 `x86_64-unknown-none` 上完成 release 链接，仅链接 `core`、`compiler_builtins` 和本库，没有 `alloc`、全局分配器或 OS 运行时。它把六个核心分解入口保留在最终可执行文件中；这是链接验证，未启动或执行裸机程序。调用方提供 `_start`、`panic_handler`，真实部署还需配置自己的启动和栈。复现需要 nightly 及已安装的 `rust-src`：
+
+```sh
+cargo -Z build-std=core -Z build-std-features=compiler-builtins-mem build --release --target x86_64-unknown-none --manifest-path checks/no_std_link/Cargo.toml --target-dir target/no-std-link
+```
+
+SIMD 使用 nightly 的 `core::simd`，逻辑数据向量保持 512 bit，无需 AVX-512。内部不变量失败使用 nightly 的 `core::process::abort_immediate`（`abort_immediate`），当前在 Rust 1.100.0-nightly 验证。未启用 `std` 时，通过平台 trap／abort 立即终止且不展开栈；启用 `std` 时保留进程 abort。库不定义 panic handler，调用方仍负责处理普通 panic 和 debug assertion。输入校验及 sink 错误仍通过 `Result` 传播。
+
 ## 性能测量入口与范围
 
 | 命令 | 观察范围 |
 | --- | --- |
-| `cargo bench --bench worst_case` | 含孔图及十一类图案：两种借用分解、image 构造、构造后立即分解、builder 整层构建；另测 scratch 初始化 |
+| `cargo bench --features alloc --bench worst_case` | 含孔图及十一类图案：两种借用分解、image 构造、构造后立即分解、builder 整层构建；另测 scratch 初始化 |
 | `cargo run --release --features profile --example worst_case_profile` | 轴区间、chord、匹配与分区的阶段耗时和规模 |
 | `cargo run --release --example low_discrepancy_1000` | 一组含孔输入的平均／最大耗时，以及最慢样本的矩形数 |
 
 `worst_case` 是基准名称，不是全局最坏输入的数学证明。`representative_64` 用确定性输入覆盖叶子／image／原生标签借用入口、直接 sink、拥有型 image 构造、构造后立即分解和 builder 整层构建，包括大 LOD、规则块、混合 LOD 行带、条纹、双色棋盘格、最大 chord 孔洞、稀疏／密集随机、稠密边框冲突、颜色小组和逆序单位像素。计时前检查各入口精确输出一致及简单图案的已知最优数；分解失败会使基准退出，不能当作零矩形计时。
+
+Criterion 只用于开发；benchmark 的 `required-features = ["alloc"]`，未启用时 Cargo 会跳过它。`profile` 同时开启 `std`／`alloc`，阶段计时依赖宿主时钟；无 features 的 `low_discrepancy_1000` 示例自身是宿主程序，调用默认 no_std／no_alloc 库。
 
 `voxel_checker_chunk_195_planes` 使用 195 份独立输入，模拟 64³ rock/air 棋盘格的三个轴各 63 个内层面与两个外边界面，总输出为 786432 个矩形。该基准测量分解与相同字段的 checksum 消费，排除面提取、顶点去重、最终 mesh 打包与 GPU 上传；独立的布局准备／材质映射实验见下方记录。全部分解基准消费矩形范围和标签，不再只读取数量，因此旧的 count-only Criterion 数字不能直接比较。
 
@@ -103,3 +126,5 @@ profile 的 `chord_groups` 仍统计有 chord 的不同标签数，计数仅发�
 固定 512-bit `std::simd` Morton 编码的局部收益、完整 pipeline 测量、nightly 要求和未保留尝试见 [SIMD 实验记录](experiments/simd512-2026-10-08.md)。SIMD 不增加原算法的工作量时保持现有复杂度；换成稠密扫描则必须重新证明上界。
 
 连续标签切面、紧凑匹配索引、直接输出、独立输入的棋盘格 chunk 与随机种子尾部测量见 [布局与 SIMD 扫描实验](experiments/layout-simd-2026-10-08.md)。几何位集匹配在部分孔洞图上更快，但其它较坏输入稳定回退，拒绝默认合入的证据见 [几何匹配实验](experiments/geometric-matching-2026-10-08.md)。
+
+默认 `no_std`／`no_alloc` 的 feature 分层、无分配器裸机链接检查、回归测试及局部性能回退见 [no_std 移植记录](experiments/no-std-2026-10-08.md)。
